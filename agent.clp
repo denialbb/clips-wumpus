@@ -465,7 +465,7 @@
 (defrule HYPO::wumpus-possible-from-stench
   (declare (salience 400))
   (stench-at (x ?sx) (y ?sy))
-  (nbr (nx ?px) (ny ?py))
+  (nbr (x ?sx) (y ?sy) (nx ?px) (ny ?py))
   (not (no-wumpus (x ?px) (y ?py)))
   (not (wumpus-possible (x ?px) (y ?py)))
   (not (and (stench-at (x ?ox) (y ?oy))
@@ -511,6 +511,8 @@
   (no-pit (x ?x) (y ?y))
   (no-wumpus (x ?x) (y ?y))
   (not (blocked (x ?x) (y ?y)))
+  (not (pit (x ?x) (y ?y)))
+  (not (wumpus (x ?x) (y ?y)))
   (not (safe (x ?x) (y ?y)))
   =>
   (assert (safe (x ?x) (y ?y))))

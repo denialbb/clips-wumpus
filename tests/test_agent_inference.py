@@ -277,3 +277,20 @@ def test_wall_pit_candidate_keeps_evidence_without_becoming_safe():
     assert (1, 1) not in cells(agent, "safe")
     assert cells(agent, "pit") == set()
     assert facts_named(agent, "guessed") == []
+
+
+def test_confirmed_hazard_is_never_inferred_safe():
+    agent = make_agent()
+    hazards = {
+        (1, 0): "(pit (x 1) (y 0))",
+        (0, 1): "(wumpus (x 0) (y 1))",
+    }
+    for cell, hazard in hazards.items():
+        x, y = cell
+        agent.env.assert_string(hazard)
+        agent.env.assert_string(f"(no-pit (x {x}) (y {y}))")
+        agent.env.assert_string(f"(no-wumpus (x {x}) (y {y}))")
+
+    drive(agent, "HYPO")
+
+    assert cells(agent, "safe").isdisjoint(hazards)
