@@ -81,6 +81,25 @@
   (slot x (type INTEGER))
   (slot y (type INTEGER)))
 
+; Orthogonal movement deltas. The direction symbols are the simulator's
+; action names; rank fixes the deterministic tie-break order used by later
+; phases: up=1 (north), right=2 (east), down=3 (south), left=4 (west).
+(deftemplate MAIN::delta
+  (slot dir (type SYMBOL) (allowed-values up down left right))
+  (slot dx (type INTEGER))
+  (slot dy (type INTEGER))
+  (slot rank (type INTEGER)))
+
+; Directed link from a safe source to one of its four neighbours. The target
+; may lie outside the known map; MAP marks it blocked once a bump proves it.
+(deftemplate MAIN::nbr
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot nx (type INTEGER))
+  (slot ny (type INTEGER))
+  (slot dir (type SYMBOL) (allowed-values up down left right))
+  (slot rank (type INTEGER)))
+
 ; Cells whose percept reported a local hazard.
 (deftemplate MAIN::breeze-at
   (slot x (type INTEGER))
@@ -162,6 +181,12 @@
   (counter (step 0))
   (config (reserve 5) (evidence 0.4) (guess-threshold 0.75)))
 
+(deffacts MAIN::movement-deltas
+  (delta (dir up) (dx 0) (dy -1) (rank 1))
+  (delta (dir right) (dx 1) (dy 0) (rank 2))
+  (delta (dir down) (dx 0) (dy 1) (rank 3))
+  (delta (dir left) (dx -1) (dy 0) (rank 4)))
+
 
 ; ---------------------------------------------------------------------------
 ; MAIN cycle control
@@ -213,12 +238,104 @@
 ; MAP: persistent map closure
 ; ---------------------------------------------------------------------------
 
-; A visited cell is safe. Hazard constraints extend this phase later.
+; A visited cell is known to be free of both hazards. The blocked guard keeps
+; contradictory manual facts from deriving safety for a cell known to be wall.
+(defrule MAP::visited-is-no-pit
+  (visited (x ?x) (y ?y))
+  (not (blocked (x ?x) (y ?y)))
+  (not (no-pit (x ?x) (y ?y)))
+  =>
+  (assert (no-pit (x ?x) (y ?y))))
+
+(defrule MAP::visited-is-no-wumpus
+  (visited (x ?x) (y ?y))
+  (not (blocked (x ?x) (y ?y)))
+  (not (no-wumpus (x ?x) (y ?y)))
+  =>
+  (assert (no-wumpus (x ?x) (y ?y))))
+
+; A visited cell is safe; blocked cells never become safe.
 (defrule MAP::visited-is-safe
   (visited (x ?x) (y ?y))
+  (not (blocked (x ?x) (y ?y)))
   (not (safe (x ?x) (y ?y)))
   =>
   (assert (safe (x ?x) (y ?y))))
+
+; Every safe cell exposes one directed link per orthogonal direction. Targets
+; outside the known map are kept: the agent discovers bounds by bumping.
+(defrule MAP::safe-has-neighbours
+  (safe (x ?x) (y ?y))
+  (delta (dir ?dir) (dx ?dx) (dy ?dy) (rank ?rank))
+  (not (blocked (x ?x) (y ?y)))
+  (not (nbr (x ?x) (y ?y) (dir ?dir)))
+  =>
+  (assert (nbr (x ?x) (y ?y) (nx (+ ?x ?dx)) (ny (+ ?y ?dy))
+               (dir ?dir) (rank ?rank))))
+
+; The agent assumes (0,0) is a corner, so negative coordinates are outside
+; the map. They are blocked and cannot hide the Wumpus, but a pit may share a
+; wall cell, hence no-pit is never derived here.
+(defrule MAP::negative-neighbour-is-outside
+  (nbr (nx ?nx) (ny ?ny))
+  (test (or (< ?nx 0) (< ?ny 0)))
+  (not (blocked (x ?nx) (y ?ny)))
+  =>
+  (assert (blocked (x ?nx) (y ?ny))))
+
+; Walls and out-of-bounds cells cannot contain the Wumpus.
+(defrule MAP::blocked-is-no-wumpus
+  (blocked (x ?x) (y ?y))
+  (not (no-wumpus (x ?x) (y ?y)))
+  =>
+  (assert (no-wumpus (x ?x) (y ?y))))
+
+; A blocked cell can never stay safe or queued for exploration.
+(defrule MAP::blocked-drops-safe
+  ?safe <- (safe (x ?x) (y ?y))
+  (blocked (x ?x) (y ?y))
+  =>
+  (retract ?safe))
+
+(defrule MAP::blocked-drops-frontier
+  ?frontier <- (frontier (x ?x) (y ?y))
+  (blocked (x ?x) (y ?y))
+  =>
+  (retract ?frontier))
+
+; Frontier: safe, unvisited, and still enterable.
+(defrule MAP::frontier-is-safe-unvisited
+  (safe (x ?x) (y ?y))
+  (not (visited (x ?x) (y ?y)))
+  (not (blocked (x ?x) (y ?y)))
+  (not (frontier (x ?x) (y ?y)))
+  =>
+  (assert (frontier (x ?x) (y ?y))))
+
+; Reaching a frontier removes it from the exploration set.
+(defrule MAP::visited-drops-frontier
+  ?frontier <- (frontier (x ?x) (y ?y))
+  (visited (x ?x) (y ?y))
+  =>
+  (retract ?frontier))
+
+; A movement that left the position unchanged hit a wall or the map boundary.
+; The target is blocked, not pit-free: a pit may share a wall cell.
+(defrule MAP::bump-blocks-target
+  ?last <- (last-move (move ?dir) (from-x ?x) (from-y ?y))
+  (pos (x ?x) (y ?y))
+  (delta (dir ?dir) (dx ?dx) (dy ?dy))
+  =>
+  (assert (blocked (x (+ ?x ?dx)) (y (+ ?y ?dy))))
+  (retract ?last))
+
+; A movement that changed the position succeeded; no wall is learned.
+(defrule MAP::move-succeeded
+  ?last <- (last-move (move ?dir) (from-x ?x) (from-y ?y))
+  (pos (x ?nx) (y ?ny))
+  (test (or (neq ?nx ?x) (neq ?ny ?y)))
+  =>
+  (retract ?last))
 
 
 ; ---------------------------------------------------------------------------
@@ -253,6 +370,15 @@
 ; ---------------------------------------------------------------------------
 ; ACT: exactly one action per cycle
 ; ---------------------------------------------------------------------------
+
+; Record the intended movement so MAP can distinguish a step from a bump.
+(defrule ACT::record-move-intent
+  (action (move ?dir))
+  (pos (x ?x) (y ?y))
+  (delta (dir ?dir) (dx ?dx) (dy ?dy))
+  (not (last-move (move ?dir) (from-x ?x) (from-y ?y)))
+  =>
+  (assert (last-move (move ?dir) (from-x ?x) (from-y ?y))))
 
 ; SCAFFOLD FALLBACK: remove once DECIDE selects a goal-driven action.
 ; At the exit, quit; anywhere else, stay put and grab.
