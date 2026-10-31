@@ -510,6 +510,9 @@ def main():
         print(f"Error loading CLIPS agent: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Bind the script module under its import name so the GUI catches the same
+    # ProtocolError class raised by this bridge when launched as a script.
+    sys.modules["wumpus"] = sys.modules[__name__]
     from gui import WumpusWorldGUI
 
     gui = WumpusWorldGUI(world, agent)

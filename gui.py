@@ -10,6 +10,8 @@ from pathlib import Path
 import tkinter as tk
 from typing import TYPE_CHECKING
 
+from wumpus import ProtocolError
+
 if TYPE_CHECKING:
     from wumpus import ClipsAgent, WumpusWorld
 
@@ -54,6 +56,17 @@ class WumpusWorldGUI:
             font=("Arial", 10, "bold"),
         )
         self.reward.pack(pady=10)
+
+        self.status = tk.Label(
+            self.side,
+            text="",
+            fg="red",
+            justify="left",
+            wraplength=300,
+        )
+        self.status.pack(fill="x", pady=5)
+
+        self.iterate = False
 
         self.btn_step = tk.Button(self.side, text="Step", command=self.step)
         self.btn_step.pack(fill="x")
@@ -145,16 +158,31 @@ class WumpusWorldGUI:
             self.iterate = False
             return
 
-        self.step()
-        self.root.after(200, self._run_loop)
+        try:
+            self.step()
+        except ProtocolError as exc:
+            self._stop_on_protocol_error(exc)
+            return
+
+        if self.iterate and not self.world.done:
+            self.root.after(200, self._run_loop)
 
     def stop_clips(self):
         self.iterate = False
 
+    def _stop_on_protocol_error(self, exc: ProtocolError) -> None:
+        self.iterate = False
+        self.status.config(text=f"Protocol error: {exc}")
+
     def step(self):
         self.refresh([])
 
-        action = self.agent.run_and_get_action()
+        try:
+            action = self.agent.run_and_get_action()
+        except ProtocolError as exc:
+            self._stop_on_protocol_error(exc)
+            return
+
         result = self.world.step(action)
         self.obs = result.obs
 
@@ -169,6 +197,7 @@ class WumpusWorldGUI:
     def reset(self):
         self.obs = self.world.reset()
         self.agent.reset(self.obs)
+        self.status.config(text="")
         self.energy.config(text=f"Agent's Energy = {self.world.energy}")
         self.reward.config(text=f"Agent's Reward = {self.world.reward}")
         self.draw()
