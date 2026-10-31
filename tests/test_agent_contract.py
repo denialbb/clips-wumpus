@@ -19,12 +19,8 @@ def test_random_agent_syntax():
     env.reset()
 
 
-@pytest.mark.xfail(reason="Intelligent agent (agent.clp) not yet implemented (TDD Red phase)", strict=False)
 def test_expert_agent_contract():
-    """
-    Contract test for the intelligent agent (agent.clp).
-    Fails (Red) until agent.clp is implemented with required modules and templates.
-    """
+    """Verify that agent.clp exposes the required modules and templates."""
     if not HAS_CLIPSPY:
         pytest.skip("clipspy not installed in test environment")
 
@@ -35,12 +31,11 @@ def test_expert_agent_contract():
     env.load(str(agent_path))
     env.reset()
 
-    # Verify required templates exist
-    templates = [t.name for t in env.templates()]
-    assert "percept" in templates
-    assert "counter" in templates
-    assert "action" in templates
+    # Verify the phase modules exist in cycle order
+    expected_modules = ["MAIN", "PERCEPT", "MAP", "HYPO", "DECIDE", "ACT"]
+    assert [module.name for module in env.modules()] == expected_modules
 
-    # Verify modular architecture
-    modules = [m.name for m in env.modules()]
-    assert len(modules) > 1, "Agent must implement multiple modules (perception, decision, etc.)"
+    # Verify the core contract templates and the action slot
+    templates = {template.name: template for template in env.templates()}
+    assert {"percept", "counter", "action"}.issubset(templates)
+    assert "move" in [slot.name for slot in templates["action"].slots]
