@@ -1,24 +1,35 @@
 from __future__ import annotations
 
-
-
-
 import argparse
-import sys
-import time
-
-from tkinter import*
-import tkinter as tk
-from dataclasses import dataclass
-from typing import Dict, Optional, Set, Tuple, List
-
 import json
-
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import clips  # pip install clipspy
 
 
-Action = str  # "up" | "down" | "left" | "right" | "grab" | "quit" | "pit-north" | "pit-south" | "pit-west" | "pit-east"
+MOVE_DELTAS = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+PIT_GUESS_DELTAS = {
+    "pit-north": (0, -1),
+    "pit-south": (0, 1),
+    "pit-west": (-1, 0),
+    "pit-east": (1, 0),
+}
+
+TERMINATION_GOLD = "gold"
+TERMINATION_QUIT = "quit"
+TERMINATION_DEATH = "death"
+TERMINATION_ENERGY = "energy"
+TERMINATION_MAX_STEPS = "max_steps"
+TERMINATION_PROTOCOL_ERROR = "protocol_error"
 
 
 @dataclass(frozen=True)
@@ -28,7 +39,47 @@ class StepResult:
     done: bool
 
 
+@dataclass(frozen=True)
+class PitGuess:
+    action: str
+    target: Tuple[int, int]
+    correct: bool
+
+
+@dataclass(frozen=True)
+class EpisodeResult:
+    actions: List[str]
+    visited: List[Tuple[int, int]]
+    guesses: List[PitGuess]
+    termination: str
+    energy: int
+    reward: float
+    steps: int
+    gold_collected: bool
+    final_position: Tuple[int, int]
+    protocol_error: Optional[str] = None
+
+    @property
+    def visited_cells(self) -> List[Tuple[int, int]]:
+        return self.visited
+
+    @property
+    def final_energy(self) -> int:
+        return self.energy
+
+    @property
+    def termination_cause(self) -> str:
+        return self.termination
+
+
 class WumpusWorld:
+    """Deterministic Wumpus World state machine.
+
+    The simulator is intentionally permissive about ``quit``: it accepts the
+    action from any cell. The harness is responsible for enforcing the
+    return-to-start rule and for reporting an invalid quit as a protocol
+    error.
+    """
 
     def __init__(
         self,
@@ -47,12 +98,12 @@ class WumpusWorld:
     ):
         self.width = width
         self.height = height
-        self.start = start
+        self.start = tuple(start)
         self.walls = walls or set()
         self.pits = pits or set()
         self.wumpus = wumpus
         self.gold = gold
-        self.original_gold = gold  # For reset
+        self.original_gold = gold
 
         self.max_steps = max_steps
         self.energy = max_steps
@@ -63,21 +114,18 @@ class WumpusWorld:
         self.end_on_grab = end_on_grab
         self.done = False
 
-        # Sanity checks
-        if start in self.walls:
+        if self.start in self.walls:
             raise ValueError("Start cannot be inside a wall.")
-        if start in self.pits:
+        if self.start in self.pits:
             raise ValueError("Start cannot be a pit.")
-        if wumpus == start:
+        if self.wumpus == self.start:
             raise ValueError("Start cannot contain wumpus.")
-        if gold == start:
-            pass
 
         for obj in self.pits | self.walls:
             if obj == self.wumpus or obj == self.gold:
                 raise ValueError("Cannot overlap walls/pits with wumpus/gold.")
 
-        self.x, self.y = start
+        self.x, self.y = self.start
         self.steps = 0
         self.dead = False
         self.has_gold = False
@@ -87,11 +135,11 @@ class WumpusWorld:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        def to_tuple(v):
-            return tuple(v) if v is not None else None
+        def to_tuple(value):
+            return tuple(value) if value is not None else None
 
         def to_tuple_set(values):
-            return {tuple(v) for v in values} if values else set()
+            return {tuple(value) for value in values} if values else set()
 
         return cls(
             width=data["width"],
@@ -108,8 +156,6 @@ class WumpusWorld:
             end_on_grab=data.get("end_on_grab", True),
         )
 
-
-
     def reset(self) -> Dict[str, object]:
         self.x, self.y = self.start
         self.steps = 0
@@ -118,8 +164,8 @@ class WumpusWorld:
         self.dead = False
         self.has_gold = False
         self.done = False
-        self.gold = self.original_gold  # Reset
-        return self._obs()
+        self.gold = self.original_gold
+        return self.observe()
 
     def _in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
@@ -132,318 +178,285 @@ class WumpusWorld:
         return {(nx, ny) for (nx, ny) in candidates if self._in_bounds(nx, ny)}
 
     def _percepts(self, x: int, y: int) -> Dict[str, bool]:
-        nbrs = self._neighbors_4(x, y)
-        breeze = any(n in self.pits for n in nbrs)
-        stench = self.wumpus in nbrs if self.wumpus else False
-        glitter =  (self.gold == (x, y)) #(not self.has_gold) and
+        neighbors = self._neighbors_4(x, y)
+        breeze = any(cell in self.pits for cell in neighbors)
+        stench = self.wumpus in neighbors if self.wumpus else False
+        glitter = self.gold == (x, y)
         return {"breeze": breeze, "stench": stench, "glitter": glitter}
 
-    def _obs(self) -> Dict[str, object]:
-        p = self._percepts(self.x, self.y)
+    def observe(self) -> Dict[str, object]:
+        """Return the current percept without changing the world."""
+        percepts = self._percepts(self.x, self.y)
         return {
             "x": self.x,
             "y": self.y,
             "steps": self.steps,
-            "breeze": p["breeze"],
-            "stench": p["stench"],
-            "glitter": p["glitter"],
-            "energy": self.energy
-            }
+            "breeze": percepts["breeze"],
+            "stench": percepts["stench"],
+            "glitter": percepts["glitter"],
+            "energy": self.energy,
+        }
+
+    def _obs(self) -> Dict[str, object]:
+        return self.observe()
 
     def _is_death_cell(self, x: int, y: int) -> bool:
-        return (x, y) in self.pits or (self.wumpus == (x, y))
+        return (x, y) in self.pits or self.wumpus == (x, y)
 
-    def step(self, action: Action) -> StepResult:
+    def step(self, action: str) -> StepResult:
+        """Apply one action; repeated calls after ``done`` are no-ops."""
+        if self.done:
+            return StepResult(self.observe(), self.reward, True)
 
         self.steps += 1
         self.energy -= 1
 
         if action == "grab":
-            if self.gold == (self.x, self.y) and not self.has_gold:
-                self.has_gold = True
-                self.gold = None
-                self.reward += self.grab_reward
-                return StepResult(self._obs(), self.reward, self.end_on_grab)
-            return StepResult(self._obs(), self.step_cost, False)
+            return self._handle_grab()
 
-        dx, dy = 0, 0
-        if action == "up":
-            dy = -1
-        elif action == "down":
-            dy = 1
-        elif action == "left":
-            dx = -1
-        elif action == "right":
-            dx = 1
-
-        nx, ny = self.x + dx, self.y + dy
-
-        if self._in_bounds(nx, ny) and not self._is_blocked(nx, ny):
-            self.x, self.y = nx, ny
-        else:
-            # Bump into wall, stay in place
-            self.energy -= 1  # Extra penalty for hitting wall
-
+        self._apply_move(action)
         if self._is_death_cell(self.x, self.y):
-            self.dead = True
-            self.energy = 0
-            self.done = True
-            self.reward += self.death_cost
-            return StepResult(self._obs(), self.reward, self.done)
-        
+            return self._handle_death()
         if action == "quit":
-            self.done = True
-            return StepResult(self._obs(), self.reward, self.done)
-        
-        guess_pit = False
-        if action == "pit-north":
-            dy = -1
-            guess_pit = True
-        elif action == "pit-south":
-            dy = 1
-            guess_pit = True
-        elif action == "pit-west":
-            dx = -1
-            guess_pit = True
-        elif action == "pit-east":
-            dx = 1
-            guess_pit = True
+            return self._handle_quit()
+        if action in PIT_GUESS_DELTAS:
+            self._score_pit_guess(action)
 
-        if guess_pit:    
-            nx, ny = self.x + dx, self.y + dy
+        self._finish_turn()
+        return StepResult(self.observe(), self.reward, self.done)
 
-            if (nx, ny) in self.pits:
-                    self.reward+= 25 
-            else:
-                    self.reward-=25
+    def _apply_move(self, action: str) -> None:
+        delta = MOVE_DELTAS.get(action)
+        if delta is None:
+            return
 
-        
-        done = self.energy <= 0
-        self.done = done
+        next_x = self.x + delta[0]
+        next_y = self.y + delta[1]
+        if self._in_bounds(next_x, next_y) and not self._is_blocked(next_x, next_y):
+            self.x, self.y = next_x, next_y
+        else:
+            # Bumping a wall or the boundary costs one extra energy unit.
+            self.energy -= 1
+
+    def _handle_grab(self) -> StepResult:
+        grabbed = self._collect_gold()
+        if not (grabbed and self.end_on_grab):
+            self._finish_turn()
+        return StepResult(self.observe(), self.reward, self.done)
+
+    def _collect_gold(self) -> bool:
+        if self.gold != (self.x, self.y) or self.has_gold:
+            return False
+        self.has_gold = True
+        self.gold = None
+        self.reward += self.grab_reward
+        self.done = self.end_on_grab
+        return True
+
+    def _handle_death(self) -> StepResult:
+        self.dead = True
+        self.energy = 0
+        self.done = True
+        self.reward += self.death_cost
+        return StepResult(self.observe(), self.reward, True)
+
+    def _handle_quit(self) -> StepResult:
+        self.done = True
+        return StepResult(self.observe(), self.reward, True)
+
+    def _score_pit_guess(self, action: str) -> None:
+        delta = PIT_GUESS_DELTAS[action]
+        target = (self.x + delta[0], self.y + delta[1])
+        if target in self.pits:
+            self.reward += 25.0
+        else:
+            self.reward -= 25.0
+
+    def _finish_turn(self) -> None:
+        self.done = self.energy <= 0
         if self.dead or self.done:
             self.reward += self.death_cost
 
-        return StepResult(self._obs(), self.step_cost, done)
+
+class ProtocolError(RuntimeError):
+    """Raised when the agent violates the one-action-per-cycle protocol."""
 
 
-# ------------------ CLIPS BRIDGE ------------------
-
-def build_many(env: clips.Environment, program: str):
-    buf, depth = [], 0
-    for ch in program:
-        buf.append(ch)
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                env.build("".join(buf).strip())
-                buf.clear()
-
-
-def clips_bool(v: bool) -> str:
-    return "TRUE" if v else "FALSE"
+def clips_bool(value: bool) -> str:
+    return "TRUE" if value else "FALSE"
 
 
 class ClipsAgent:
+    """Thin clipspy bridge implementing the perception/action protocol."""
+
     def __init__(self, program: str):
         self.env = clips.Environment()
         self.env.load(program)
         self.env.reset()
 
-    def reset(self):
+    def reset(self, obs: Optional[Dict[str, object]] = None) -> None:
+        """Reset working memory, leaving one counter and the initial percept."""
         self.env.reset()
+        self._ensure_single_counter(0)
+        if obs is not None:
+            self.set_percept(obs)
 
-    def clear_action_facts(self):
-        for f in list(self.env.facts()):
-            if f.template.name == "action":
-                f.retract()
+    def _facts(self, template_name: str) -> List[clips.Fact]:
+        return [f for f in self.env.facts() if f.template.name == template_name]
 
-    def assert_percept(self, obs):
-        fact = (
-           f'(percept (x {obs["x"]}) (y {obs["y"]}) '
-#           f'(gx {obs.get("gx", 0)}) (gy {obs.get("gy", 0)}) '  # Add gold coords if available
-#           f'(w {obs["w"]}) (h {obs["h"]}) (steps {obs["steps"]}) '
-           f'(steps {obs["steps"]}) '
-           f'(breeze {clips_bool(obs["breeze"])}) '
-           f'(stench {clips_bool(obs["stench"])}) '
-           f'(glitter {clips_bool(obs["glitter"])}) ' 
-           f'(energy {obs["energy"]}))'
-        )
-        self.env.assert_string(fact)
-        
-    def update_time_counter(self, obs):
-        for f in self.env.facts():
-           if f.template.name == "counter":
-               self.env.eval(f"(modify {f.index} (step {obs["steps"]}))")
+    def _retract_template(self, template_name: str) -> None:
+        for fact in self._facts(template_name):
+            fact.retract()
 
-    def agenda_snapshot(self):
-        return [str(a) for a in self.env.activations()]
-
-    def run_and_get_action(self):
-        self.env.run()
-        for f in self.env.facts():
-            if f.template.name == "action":
-                return str(f["move"])
-        return "right" # Default action if none provided 
-
-
-# ------------------ GUI ------------------
-
-class WumpusWorldGUI:
-    def __init__(self, world: WumpusWorld, agent: ClipsAgent):
-        self.world = world
-        self.agent = agent
-
-        self.root = tk.Tk()
-        self.root.title("Wumpus World with Walls")
-
-        self.cell = 60
-        self.pad = 10
-
-        w = world.width * self.cell + 2 * self.pad
-        h = world.height * self.cell + 2 * self.pad
-
-        self.canvas = tk.Canvas(self.root, width=w, height=h, bg="white")
-        self.canvas.pack(side="left")
-
-        self.side = tk.Frame(self.root)
-        self.side.pack(side="right", fill="y")
-
-
-        tk.Label(self.side, text="Facts").pack()
-        self.facts = tk.Listbox(self.side, height=15, width=45)
-        self.facts.pack()
-
-        tk.Label(self.side, text="Agenda").pack()
-        self.agenda = tk.Listbox(self.side, height=10, width=45)
-        self.agenda.pack()
-
-
-        self.energy = tk.Label(self.side, text=f"Agent's Energy = {self.world.energy}", font=("Arial", 10, "bold")) 
-        self.energy.pack(pady=10)
-        self.reward = tk.Label(self.side, text=f"Agent's Reward = {self.world.reward}", font=("Arial", 10, "bold")) 
-        self.reward.pack(pady=10)        
-
-        self.btn_step = tk.Button(self.side, text="Step", command=self.step)
-        self.btn_step.pack(fill="x")
-
-        self.btn_run = tk.Button(self.side, text="Run", command=self.run_clips)
-        self.btn_run.pack(fill="x")
-
-        self.btn_stop = tk.Button(self.side, text="Stop", command=self.stop_clips)
-        self.btn_stop.pack(fill="x")        
-
-        self.btn_reset = tk.Button(self.side, text="Reset", command=self.reset)
-        self.btn_reset.pack(fill="x")
-
-        self.obs = self.world.reset()
-        self.draw()
-        self.refresh()
-
-    def cell_box(self, x, y):
-        x0 = self.pad + x * self.cell
-        y0 = self.pad + y * self.cell
-        return x0, y0, x0 + self.cell, y0 + self.cell
-
-    def draw(self):
-        self.canvas.delete("all")
-
-        for y in range(self.world.height):
-            for x in range(self.world.width):
-                self.canvas.create_rectangle(*self.cell_box(x, y), outline="gray")
-
-        # Walls
-        for x, y in self.world.walls:
-            self.canvas.create_rectangle(*self.cell_box(x, y), fill="black")
-
-        # Pits
-        for x, y in self.world.pits:
-            self.canvas.create_text(*self._center(x, y), text="P", fill="black", font=("Arial", 16, "bold"))
-
-        # Wumpus
-        if self.world.wumpus:
-            self.canvas.create_text(*self._center(*self.world.wumpus), text="W", fill="red", font=("Arial", 16, "bold"))
-
-        # Gold
-        if self.world.gold and not self.world.has_gold:
-            self.canvas.create_text(*self._center(*self.world.gold), text="$", fill="gold", font=("Arial", 18, "bold"))
-            
-        self.img = tk.PhotoImage(file = 'exit.gif')
-        self.img = self.img.subsample(20, 20)   #create a new image half as large as the original
-        self.canvas.create_image(*self._center(0,0),image=self.img,anchor='c')             
-
-        # Agent
-        self.canvas.create_text(*self._center(self.world.x, self.world.y), text="A", fill="blue", font=("Arial", 18, "bold"))
-
-    def _center(self, x, y):
-        x0, y0, x1, y1 = self.cell_box(x, y)
-        return (x0 + x1) // 2, (y0 + y1) // 2
-
-    def refresh(self, agenda_snapshot=None):
-        self.facts.delete(0, tk.END)
-        for f in self.agent.env.facts():
-            self.facts.insert(tk.END, str(f))
-
-        self.agenda.delete(0, tk.END)
-        acts = agenda_snapshot if agenda_snapshot else []
-        for a in acts:
-            self.agenda.insert(tk.END, a)
-
-    def run_clips(self):
-        self.iterate = True
-        self._run_loop()
-
-    def _run_loop(self):
-        if not self.iterate or self.world.done:
-            self.iterate = False
+    def _ensure_single_counter(self, step: Optional[int] = None) -> None:
+        counters = self._facts("counter")
+        if not counters:
+            self.env.assert_string("(counter (step 0))")
             return
+        for extra in counters[1:]:
+            extra.retract()
+        if step is not None:
+            self.env.eval(f"(modify {counters[0].index} (step {step}))")
 
-        self.step()
+    def set_percept(self, obs: Dict[str, object]) -> None:
+        """Replace the working-memory percept and synchronize the counter."""
+        self._retract_template("percept")
+        self.env.assert_string(self._percept_string(obs))
+        self.update_time_counter(obs)
 
-        # schedule next iteration (500 ms)
-        self.root.after(200, self._run_loop)
+    def _percept_string(self, obs: Dict[str, object]) -> str:
+        return (
+            f"(percept (x {obs['x']}) (y {obs['y']}) "
+            f"(steps {obs['steps']}) "
+            f"(breeze {clips_bool(obs['breeze'])}) "
+            f"(stench {clips_bool(obs['stench'])}) "
+            f"(glitter {clips_bool(obs['glitter'])}) "
+            f"(energy {obs['energy']}))"
+        )
 
-    def stop_clips(self):
-        self.iterate = False
+    def update_time_counter(self, obs: Dict[str, object]) -> None:
+        for fact in self._facts("counter"):
+            self.env.eval(f"(modify {fact.index} (step {obs['steps']}))")
 
-    def step(self):
-        self.refresh([])
+    def clear_action_facts(self) -> None:
+        self._retract_template("action")
 
-        action = self.agent.run_and_get_action()
-        result = self.world.step(action)
+    def agenda_snapshot(self) -> List[str]:
+        return [str(activation) for activation in self.env.activations()]
 
-        self.obs = result.obs
-       
-
-        self.agent.clear_action_facts()
-        self.agent.assert_percept(self.obs)
-        self.agent.update_time_counter(self.obs)
-
-        agenda_before = self.agent.agenda_snapshot()
-        self.refresh(agenda_before)
-
-        self.energy.config(text=f"Agent's Energy = {self.world.energy}")
-        self.reward.config(text=f"Agent's Reward = {self.world.reward}")
-
-        self.draw()
-
-
-    def reset(self):
-        self.obs = self.world.reset()
-        self.agent.reset()
-        self.agent.assert_percept(self.obs)
-        self.energy.config(text=f"Agent's Energy = {self.world.energy}")
-        self.reward.config(text=f"Agent's Reward = {self.world.reward}")
-        self.draw()
-        self.refresh([])
-
-    def run(self):
-        self.root.mainloop()
+    def run_and_get_action(self) -> str:
+        """Run CLIPS and return the single action asserted in this cycle."""
+        self.env.run()
+        actions = [str(fact["move"]) for fact in self._facts("action")]
+        if len(actions) != 1:
+            raise ProtocolError(
+                "Expected exactly one action fact per cycle, "
+                f"found {len(actions)}"
+            )
+        return actions[0]
 
 
-# ------------------ MAIN ------------------
+def _position(world: WumpusWorld) -> Tuple[int, int]:
+    return (world.x, world.y)
 
+
+def _record_visit(
+    visited: List[Tuple[int, int]], x: int, y: int
+) -> None:
+    cell = (x, y)
+    if cell not in visited:
+        visited.append(cell)
+
+
+def _pit_guess(
+    action: str, x: int, y: int, pits: Set[Tuple[int, int]]
+) -> Optional[PitGuess]:
+    delta = PIT_GUESS_DELTAS.get(action)
+    if delta is None:
+        return None
+    target = (x + delta[0], y + delta[1])
+    return PitGuess(action=action, target=target, correct=target in pits)
+
+
+def _termination_cause(
+    world: WumpusWorld,
+    actions: List[str],
+    protocol_error: Optional[str],
+) -> str:
+    if protocol_error is not None:
+        return TERMINATION_PROTOCOL_ERROR
+    if world.dead:
+        return TERMINATION_DEATH
+    if not world.done:
+        return TERMINATION_MAX_STEPS
+
+    last_action = actions[-1] if actions else None
+    if last_action == "quit":
+        return TERMINATION_QUIT
+    if world.end_on_grab and world.has_gold:
+        return TERMINATION_GOLD
+    return TERMINATION_ENERGY if world.energy <= 0 else TERMINATION_GOLD
+
+
+def run_episode(
+    world: WumpusWorld,
+    agent,
+    max_steps: Optional[int] = None,
+) -> EpisodeResult:
+    """Run one headless episode from a fresh world state.
+
+    The initial percept is asserted before the first ``run`` call. After each
+    action the action fact and the old percept are retracted, and the new
+    percept is asserted. A successful grab ends the episode only when the
+    world is configured with ``end_on_grab``.
+
+    ``max_steps`` caps the number of actions; by default it matches the
+    world's energy budget.
+    """
+    agent.reset(world.reset())
+
+    actions: List[str] = []
+    visited: List[Tuple[int, int]] = [_position(world)]
+    guesses: List[PitGuess] = []
+    protocol_error: Optional[str] = None
+    limit = world.max_steps if max_steps is None else max_steps
+
+    while not world.done and len(actions) < limit:
+        try:
+            action = agent.run_and_get_action()
+        except ProtocolError as exc:
+            protocol_error = str(exc)
+            break
+
+        guess = _pit_guess(action, world.x, world.y, world.pits)
+        result = world.step(action)
+        actions.append(action)
+        if guess is not None:
+            guesses.append(guess)
+        _record_visit(visited, world.x, world.y)
+
+        agent.clear_action_facts()
+        agent.set_percept(result.obs)
+
+        if action == "quit" and _position(world) != world.start:
+            protocol_error = (
+                f"Invalid quit at {_position(world)}; "
+                f"the agent must return to {world.start}"
+            )
+            break
+
+    return EpisodeResult(
+        actions=actions,
+        visited=visited,
+        guesses=guesses,
+        termination=_termination_cause(world, actions, protocol_error),
+        energy=world.energy,
+        reward=world.reward,
+        steps=len(actions),
+        gold_collected=world.has_gold,
+        final_position=_position(world),
+        protocol_error=protocol_error,
+    )
 
 
 def default_world() -> WumpusWorld:
@@ -455,6 +468,7 @@ def default_world() -> WumpusWorld:
         pits={(2, 3), (5, 4)},
         wumpus=(3, 2),
         gold=(7, 5),
+        end_on_grab=False,
     )
 
 
@@ -478,8 +492,6 @@ def parse_args():
     return parser.parse_args()
 
 
-
-
 def main():
     args = parse_args()
 
@@ -488,20 +500,23 @@ def main():
             world = WumpusWorld.from_json(args.map_file)
         else:
             world = default_world()
-    except Exception as e:
-        print(f"Error loading map: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Error loading map: {exc}", file=sys.stderr)
         sys.exit(1)
 
     try:
         agent = ClipsAgent(args.agent_file)
-    except Exception as e:
-        print(f"Error loading CLIPS agent: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Error loading CLIPS agent: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Bind the script module under its import name so the GUI catches the same
+    # ProtocolError class raised by this bridge when launched as a script.
+    sys.modules["wumpus"] = sys.modules[__name__]
+    from gui import WumpusWorldGUI
 
     gui = WumpusWorldGUI(world, agent)
     gui.run()
-
-
 
 
 if __name__ == "__main__":

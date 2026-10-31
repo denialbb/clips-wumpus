@@ -29,10 +29,11 @@ jobs:
 
       - name: Lint and Cyclomatic Complexity Check
         run: |
-          # Enforce flake8 code style and complexity threshold
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Radon cyclomatic complexity check
-          radon cc -s -a -nb --max-average B tests/
+          # Enforce flake8 syntax and undefined-name checks outside generated files
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=.venv,__pycache__,.git
+          # Radon report covers the simulator, the GUI, the tools and the tests;
+          # the per-function grade B limit is enforced by tests/test_complexity.py
+          radon cc -s -a -nb wumpus.py gui.py tools/ tests/
 
       - name: Run test suite
         run: |

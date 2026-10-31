@@ -1,4 +1,4 @@
-clipspy>=1.0.0
+clipspy>=1.0.6
 pytest>=7.0.0
 radon>=5.1.0
 flake8>=6.0.0
