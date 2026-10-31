@@ -76,9 +76,11 @@ def test_new_percept_replaces_old_percept_and_advances_counter():
     assert str(counters[0]["step"]) == "1"
 
 
-def test_scaffold_fallback_quits_only_at_origin():
-    origin_agent = make_agent(make_obs(x=0, y=0))
-    assert origin_agent.run_and_get_action() == "quit"
+def test_origin_explores_the_best_affordable_frontier():
+    agent = make_agent(make_obs(x=0, y=0))
+    assert agent.run_and_get_action() == "right"
 
-    away_agent = make_agent(make_obs(x=1, y=0))
-    assert away_agent.run_and_get_action() == "grab"
+
+def test_low_energy_at_origin_quits_instead_of_exploring():
+    agent = make_agent(make_obs(x=0, y=0, energy=4))
+    assert agent.run_and_get_action() == "quit"
