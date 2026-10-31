@@ -109,12 +109,26 @@
   (slot x (type INTEGER))
   (slot y (type INTEGER)))
 
+; Cells whose percept explicitly reported no local hazard.
+(deftemplate MAIN::no-breeze-at
+  (slot x (type INTEGER))
+  (slot y (type INTEGER)))
+
+(deftemplate MAIN::no-stench-at
+  (slot x (type INTEGER))
+  (slot y (type INTEGER)))
+
 ; A hazard candidate for a source cell; owned by HYPO.
 (deftemplate MAIN::candidate
   (slot bx (type INTEGER))
   (slot by (type INTEGER))
   (slot px (type INTEGER))
   (slot py (type INTEGER)))
+
+; A cell consistent with every stench observed so far; owned by HYPO.
+(deftemplate MAIN::wumpus-possible
+  (slot x (type INTEGER))
+  (slot y (type INTEGER)))
 
 ; Per-source pit belief; source slots keep evidence facts distinct.
 (deftemplate MAIN::pit-hypothesis
@@ -170,12 +184,23 @@
   (slot from-y (type INTEGER)))
 
 ; MYCIN positive-evidence combination for explicit CF slots.
-(deffunction MAIN::combine-cf-positive (?a ?b)
+(deffunction combine-cf-positive (?a ?b)
   "Combine two positive certainty factors and clamp to [0.0, 1.0]."
   (bind ?cf (+ ?a (* ?b (- 1.0 ?a))))
   (if (> ?cf 1.0) then (bind ?cf 1.0))
   (if (< ?cf 0.0) then (bind ?cf 0.0))
   ?cf)
+
+; Number of pit candidates explained by one breeze source.
+(deffunction candidate-count (?bx ?by)
+  "Count the candidate facts attached to a breeze source."
+  (length$ (find-all-facts ((?c candidate))
+             (and (= ?c:bx ?bx) (= ?c:by ?by)))))
+
+; Number of cells compatible with every observed stench.
+(deffunction wumpus-count ()
+  "Count the cells that can hold the single Wumpus."
+  (length$ (find-all-facts ((?w wumpus-possible)) TRUE)))
 
 (deffacts MAIN::initial-state
   (counter (step 0))
@@ -274,14 +299,18 @@
                (dir ?dir) (rank ?rank))))
 
 ; The agent assumes (0,0) is a corner, so negative coordinates are outside
-; the map. They are blocked and cannot hide the Wumpus, but a pit may share a
-; wall cell, hence no-pit is never derived here.
+; the map. They are blocked, cannot hide a pit, and cannot hide the Wumpus.
+; The negated conjunction keeps the three conclusions in one closure step.
 (defrule MAP::negative-neighbour-is-outside
   (nbr (nx ?nx) (ny ?ny))
   (test (or (< ?nx 0) (< ?ny 0)))
-  (not (blocked (x ?nx) (y ?ny)))
+  (not (and (blocked (x ?nx) (y ?ny))
+            (no-pit (x ?nx) (y ?ny))
+            (no-wumpus (x ?nx) (y ?ny))))
   =>
-  (assert (blocked (x ?nx) (y ?ny))))
+  (assert (blocked (x ?nx) (y ?ny))
+          (no-pit (x ?nx) (y ?ny))
+          (no-wumpus (x ?nx) (y ?ny))))
 
 ; Walls and out-of-bounds cells cannot contain the Wumpus.
 (defrule MAP::blocked-is-no-wumpus
@@ -342,18 +371,228 @@
 ; HYPO: hazard evidence and pit hypotheses
 ; ---------------------------------------------------------------------------
 
-; Record hazard evidence; candidate and CF rules extend this phase later.
+; Record hazard evidence for the current cell. Positive and negative facts for
+; the same cell exclude each other.
 (defrule HYPO::record-breeze
+  (declare (salience 500))
   (percept (x ?x) (y ?y) (breeze TRUE))
   (not (breeze-at (x ?x) (y ?y)))
+  (not (no-breeze-at (x ?x) (y ?y)))
   =>
   (assert (breeze-at (x ?x) (y ?y))))
 
+(defrule HYPO::record-no-breeze
+  (declare (salience 500))
+  (percept (x ?x) (y ?y) (breeze FALSE))
+  (not (no-breeze-at (x ?x) (y ?y)))
+  (not (breeze-at (x ?x) (y ?y)))
+  =>
+  (assert (no-breeze-at (x ?x) (y ?y))))
+
 (defrule HYPO::record-stench
+  (declare (salience 500))
   (percept (x ?x) (y ?y) (stench TRUE))
   (not (stench-at (x ?x) (y ?y)))
+  (not (no-stench-at (x ?x) (y ?y)))
   =>
   (assert (stench-at (x ?x) (y ?y))))
+
+(defrule HYPO::record-no-stench
+  (declare (salience 500))
+  (percept (x ?x) (y ?y) (stench FALSE))
+  (not (no-stench-at (x ?x) (y ?y)))
+  (not (stench-at (x ?x) (y ?y)))
+  =>
+  (assert (no-stench-at (x ?x) (y ?y))))
+
+; A cell without breeze cannot have a pit in any orthogonal neighbour, even
+; when the neighbour is a wall or lies outside the map.
+(defrule HYPO::no-breeze-rules-out-pit
+  (declare (salience 480))
+  (no-breeze-at (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny))
+  (not (no-pit (x ?nx) (y ?ny)))
+  =>
+  (assert (no-pit (x ?nx) (y ?ny))))
+
+; A cell without stench cannot have the Wumpus in any orthogonal neighbour.
+(defrule HYPO::no-stench-rules-out-wumpus
+  (declare (salience 480))
+  (no-stench-at (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny))
+  (not (no-wumpus (x ?nx) (y ?ny)))
+  =>
+  (assert (no-wumpus (x ?nx) (y ?ny))))
+
+; A pit cannot contain the Wumpus.
+(defrule HYPO::pit-is-no-wumpus
+  (declare (salience 460))
+  (pit (x ?x) (y ?y))
+  (not (no-wumpus (x ?x) (y ?y)))
+  =>
+  (assert (no-wumpus (x ?x) (y ?y))))
+
+; The Wumpus cannot share a pit.
+(defrule HYPO::wumpus-is-no-pit
+  (declare (salience 460))
+  (wumpus (x ?x) (y ?y))
+  (not (no-pit (x ?x) (y ?y)))
+  =>
+  (assert (no-pit (x ?x) (y ?y))))
+
+; A candidate that later stops being a possible pit no longer explains a breeze.
+(defrule HYPO::drop-invalid-candidate
+  (declare (salience 440))
+  ?candidate <- (candidate (px ?px) (py ?py))
+  (or (no-pit (x ?px) (y ?py))
+      (wumpus (x ?px) (y ?py)))
+  =>
+  (retract ?candidate))
+
+; A hypothesis is not a classical fact: discard it when the target is excluded.
+(defrule HYPO::drop-invalid-pit-hypothesis
+  (declare (salience 440))
+  ?hypothesis <- (pit-hypothesis (x ?x) (y ?y))
+  (or (no-pit (x ?x) (y ?y))
+      (wumpus (x ?x) (y ?y)))
+  =>
+  (retract ?hypothesis))
+
+; A cell compatible with every stench must be adjacent to every stench cell.
+; The negated conjunction expresses "no stench cell lacks this neighbour" as a
+; single condition, so a new stench invalidates stale possibilities without a
+; derive/prune oscillation.
+(defrule HYPO::wumpus-possible-from-stench
+  (declare (salience 400))
+  (stench-at (x ?sx) (y ?sy))
+  (nbr (x ?sx) (y ?sy) (nx ?px) (ny ?py))
+  (not (no-wumpus (x ?px) (y ?py)))
+  (not (wumpus-possible (x ?px) (y ?py)))
+  (not (and (stench-at (x ?ox) (y ?oy))
+            (not (nbr (x ?ox) (y ?oy) (nx ?px) (ny ?py)))))
+  =>
+  (assert (wumpus-possible (x ?px) (y ?py))))
+
+; Discard a possibility when a newer stench cell is not adjacent to it.
+(defrule HYPO::prune-wumpus-possible
+  (declare (salience 420))
+  ?possible <- (wumpus-possible (x ?px) (y ?py))
+  (stench-at (x ?ox) (y ?oy))
+  (not (nbr (x ?ox) (y ?oy) (nx ?px) (ny ?py)))
+  =>
+  (retract ?possible))
+
+; Discard a possibility once another rule proves the cell Wumpus-free.
+(defrule HYPO::drop-invalid-wumpus-possible
+  (declare (salience 420))
+  ?possible <- (wumpus-possible (x ?px) (y ?py))
+  (no-wumpus (x ?px) (y ?py))
+  =>
+  (retract ?possible))
+
+; The Wumpus is unique, so a single remaining possibility is a certainty.
+; The negated conjunction rebuilds the activation whenever the possibility set
+; shrinks, and the count is read at firing time to avoid a stale match.
+(defrule HYPO::confirm-wumpus
+  (declare (salience 380))
+  (stench-at (x ?sx) (y ?sy))
+  (wumpus-possible (x ?px) (y ?py))
+  (not (wumpus (x ?) (y ?)))
+  (not (and (wumpus-possible (x ?ox) (y ?oy))
+            (test (or (neq ?ox ?px) (neq ?oy ?py)))))
+  =>
+  (if (= (wumpus-count) 1)
+     then
+     (assert (wumpus (x ?px) (y ?py)))))
+
+; Safety is classical: both hazards excluded and the cell is enterable.
+(defrule HYPO::infer-safe
+  (declare (salience 360))
+  (no-pit (x ?x) (y ?y))
+  (no-wumpus (x ?x) (y ?y))
+  (not (blocked (x ?x) (y ?y)))
+  (not (pit (x ?x) (y ?y)))
+  (not (wumpus (x ?x) (y ?y)))
+  (not (safe (x ?x) (y ?y)))
+  =>
+  (assert (safe (x ?x) (y ?y))))
+
+; Every neighbour of a breeze that is not already excluded explains the breeze.
+; Confirmed pits stay candidates: removing them would make a second cell look
+; like the unique explanation and cause a false confirmation.
+(defrule HYPO::breeze-pit-candidate
+  (declare (salience 340))
+  (breeze-at (x ?bx) (y ?by))
+  (nbr (x ?bx) (y ?by) (nx ?px) (ny ?py))
+  (not (no-pit (x ?px) (y ?py)))
+  (not (wumpus (x ?px) (y ?py)))
+  (not (candidate (bx ?bx) (by ?by) (px ?px) (py ?py)))
+  =>
+  (assert (candidate (bx ?bx) (by ?by) (px ?px) (py ?py))))
+
+; A breeze with a single candidate proves that candidate is a pit. The
+; negated conjunction keeps the activation fresh when a candidate is retracted;
+; the count is read at firing time so a stale unique match cannot confirm early.
+(defrule HYPO::confirm-pit
+  (declare (salience 300))
+  (breeze-at (x ?bx) (y ?by))
+  (candidate (bx ?bx) (by ?by) (px ?px) (py ?py))
+  (not (pit (x ?px) (y ?py)))
+  (not (and (candidate (bx ?bx) (by ?by) (px ?ox) (py ?oy))
+            (test (or (neq ?ox ?px) (neq ?oy ?py)))))
+  =>
+  (if (= (candidate-count ?bx ?by) 1)
+     then
+     (assert (pit (x ?px) (y ?py)))))
+
+; A confirmed pit always carries full certainty.
+(defrule HYPO::raise-confirmed-pit
+  (declare (salience 280))
+  ?hypothesis <- (pit-hypothesis (x ?x) (y ?y) (cf ?cf))
+  (pit (x ?x) (y ?y))
+  (test (< ?cf 1.0))
+  =>
+  (modify ?hypothesis (cf 1.0)))
+
+; A confirmed pit without prior evidence still gets one full-certainty fact.
+; An excluded target is not a pit hypothesis, even if contradictory pit facts
+; remain in working memory.
+(defrule HYPO::assert-confirmed-pit-hypothesis
+  (declare (salience 270))
+  (pit (x ?x) (y ?y))
+  (not (no-pit (x ?x) (y ?y)))
+  (not (pit-hypothesis (x ?x) (y ?y)))
+  =>
+  (assert (pit-hypothesis (x ?x) (y ?y) (cf 1.0)
+                          (source-x -1) (source-y -1))))
+
+; Each breeze contributes one piece of evidence per surviving candidate.
+; The source slots keep otherwise identical facts distinct; evidence-seen stops
+; the same breeze from contributing again on a later cycle.
+(defrule HYPO::pit-hypothesis-evidence
+  (declare (salience 260))
+  (candidate (bx ?bx) (by ?by) (px ?px) (py ?py))
+  (config (evidence ?evidence))
+  (not (pit (x ?px) (y ?py)))
+  (not (evidence-seen (source-x ?bx) (source-y ?by)
+                      (x ?px) (y ?py)))
+  =>
+  (assert (evidence-seen (source-x ?bx) (source-y ?by)
+                         (x ?px) (y ?py)))
+  (assert (pit-hypothesis (x ?px) (y ?py) (cf ?evidence)
+                          (source-x ?bx) (source-y ?by))))
+
+; Combine all positive evidence about the same target. The MYCIN formula is
+; commutative and associative, so the final value does not depend on pair order.
+(defrule HYPO::combine-pit-hypotheses
+  (declare (salience 240))
+  ?first <- (pit-hypothesis (x ?x) (y ?y) (cf ?cf1))
+  ?second <- (pit-hypothesis (x ?x) (y ?y) (cf ?cf2))
+  (test (neq ?first ?second))
+  =>
+  (retract ?first)
+  (modify ?second (cf (combine-cf-positive ?cf1 ?cf2))))
+
 
 
 ; ---------------------------------------------------------------------------
