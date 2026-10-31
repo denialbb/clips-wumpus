@@ -239,12 +239,19 @@ class WumpusWorld:
             self.energy -= 1
 
     def _handle_grab(self) -> StepResult:
-        if self.gold == (self.x, self.y) and not self.has_gold:
-            self.has_gold = True
-            self.gold = None
-            self.reward += self.grab_reward
-            self.done = self.end_on_grab
+        grabbed = self._collect_gold()
+        if not (grabbed and self.end_on_grab):
+            self._finish_turn()
         return StepResult(self.observe(), self.reward, self.done)
+
+    def _collect_gold(self) -> bool:
+        if self.gold != (self.x, self.y) or self.has_gold:
+            return False
+        self.has_gold = True
+        self.gold = None
+        self.reward += self.grab_reward
+        self.done = self.end_on_grab
+        return True
 
     def _handle_death(self) -> StepResult:
         self.dead = True
@@ -386,7 +393,7 @@ def _termination_cause(
     last_action = actions[-1] if actions else None
     if last_action == "quit":
         return TERMINATION_QUIT
-    if last_action == "grab":
+    if world.end_on_grab and world.has_gold:
         return TERMINATION_GOLD
     return TERMINATION_ENERGY if world.energy <= 0 else TERMINATION_GOLD
 
@@ -461,6 +468,7 @@ def default_world() -> WumpusWorld:
         pits={(2, 3), (5, 4)},
         wumpus=(3, 2),
         gold=(7, 5),
+        end_on_grab=False,
     )
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wumpus import WumpusWorld
+from wumpus import WumpusWorld, default_world
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +91,51 @@ def test_failed_grab_returns_accumulated_reward():
     assert result.reward == world.reward == 0.0
     assert result.done is False
     assert world.has_gold is False
+
+
+def test_failed_grab_at_last_energy_ends_episode_with_one_death_penalty():
+    world = make_world(max_steps=1)
+
+    result = world.step("grab")
+
+    assert result.done is True
+    assert world.done is True
+    assert world.energy == 0
+    assert world.reward == -100.0
+    assert result.reward == -100.0
+    assert world.step("right").reward == -100.0
+
+
+def test_successful_grab_at_last_energy_without_end_on_grab_ends_episode():
+    world = make_world(gold=(0, 0), max_steps=1, end_on_grab=False)
+
+    result = world.step("grab")
+
+    assert result.done is True
+    assert world.done is True
+    assert world.has_gold is True
+    assert world.energy == 0
+    assert world.reward == 0.0
+    assert result.reward == 0.0
+    assert world.step("right").reward == 0.0
+
+
+def test_successful_grab_at_last_energy_with_end_on_grab_has_no_death_penalty():
+    world = make_world(gold=(0, 0), max_steps=1, end_on_grab=True)
+
+    result = world.step("grab")
+
+    assert result.done is True
+    assert world.done is True
+    assert world.energy == 0
+    assert world.reward == 100.0
+    assert result.reward == 100.0
+
+
+def test_default_world_allows_return_after_grab():
+    world = default_world()
+
+    assert world.end_on_grab is False
 
 
 def test_quit_sets_done_without_scoring():

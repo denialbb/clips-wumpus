@@ -113,6 +113,42 @@ def test_episode_terminates_on_energy_exhaustion():
     assert result.steps == 1
 
 
+def test_episode_failed_grab_at_last_energy_terminates_energy():
+    world = make_world(max_steps=1)
+    agent = ScriptedAgent(["grab"])
+
+    result = run_episode(world, agent)
+
+    assert result.termination == "energy"
+    assert result.reward == -100.0
+    assert result.energy == 0
+    assert result.steps == 1
+
+
+def test_episode_grab_without_end_on_grab_at_last_energy_terminates_energy():
+    world = make_world(gold=(0, 0), max_steps=1, end_on_grab=False)
+    agent = ScriptedAgent(["grab"])
+
+    result = run_episode(world, agent)
+
+    assert result.termination == "energy"
+    assert result.gold_collected is True
+    assert result.reward == 0.0
+    assert result.steps == 1
+
+
+def test_episode_grab_with_end_on_grab_at_last_energy_terminates_gold():
+    world = make_world(gold=(0, 0), max_steps=1, end_on_grab=True)
+    agent = ScriptedAgent(["grab"])
+
+    result = run_episode(world, agent)
+
+    assert result.termination == "gold"
+    assert result.gold_collected is True
+    assert result.reward == 100.0
+    assert result.steps == 1
+
+
 def test_episode_terminates_on_max_steps():
     world = make_world(width=5)
     agent = ScriptedAgent(["right", "right", "right"])
