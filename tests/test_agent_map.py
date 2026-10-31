@@ -58,7 +58,7 @@ def test_origin_seeds_position_and_neighbour_graph():
 
     assert len(facts_named(agent, "pos")) == 1
     assert cells(agent, "visited") == {(0, 0)}
-    assert cells(agent, "safe") == {(0, 0)}
+    assert cells(agent, "safe") == {(0, 0), (1, 0), (0, 1)}
     assert (0, 0) in cells(agent, "no-pit")
     assert (0, 0) in cells(agent, "no-wumpus")
 
@@ -74,14 +74,15 @@ def test_origin_seeds_position_and_neighbour_graph():
     }
 
 
-def test_negative_neighbours_are_blocked_but_not_pit_free():
+def test_negative_neighbours_are_outside_and_hazard_free():
     agent = make_agent()
     agent.run_and_get_action()
 
     outside = {(0, -1), (-1, 0)}
     assert cells(agent, "blocked") == outside
     assert outside <= cells(agent, "no-wumpus")
-    assert cells(agent, "no-pit").isdisjoint(outside)
+    assert outside <= cells(agent, "no-pit")
+    assert cells(agent, "safe").isdisjoint(outside)
 
 
 def test_frontier_appears_for_safe_unvisited_cell_and_disappears_when_blocked():
@@ -92,13 +93,13 @@ def test_frontier_appears_for_safe_unvisited_cell_and_disappears_when_blocked():
     agent.clear_action_facts()
     agent.env.assert_string("(safe (x 1) (y 0))")
     agent.env.run()
-    assert cells(agent, "frontier") == {(1, 0)}
+    assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
     agent.env.assert_string("(blocked (x 1) (y 0))")
     agent.env.run()
     assert (1, 0) not in cells(agent, "safe")
-    assert cells(agent, "frontier") == set()
+    assert cells(agent, "frontier") == {(0, 1)}
 
 
 def test_frontier_disappears_when_cell_becomes_visited():
@@ -108,12 +109,12 @@ def test_frontier_disappears_when_cell_becomes_visited():
     agent.clear_action_facts()
     agent.env.assert_string("(safe (x 1) (y 0))")
     agent.env.run()
-    assert cells(agent, "frontier") == {(1, 0)}
+    assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
     agent.env.assert_string("(visited (x 1) (y 0))")
     agent.env.run()
-    assert cells(agent, "frontier") == set()
+    assert cells(agent, "frontier") == {(0, 1)}
 
 
 def test_act_records_movement_intent():
@@ -149,12 +150,12 @@ def test_successful_move_updates_position_and_consumes_intent():
 
 
 def test_bump_blocks_target_without_marking_it_pit_free():
-    agent = make_agent()
+    agent = make_agent(make_obs(breeze=True))
     agent.run_and_get_action()
 
     agent.clear_action_facts()
     record_move(agent, "right", 0, 0)
-    agent.set_percept(make_obs(steps=1, energy=198))
+    agent.set_percept(make_obs(steps=1, energy=198, breeze=True))
     agent.run_and_get_action()
 
     assert (1, 0) in cells(agent, "blocked")
@@ -163,13 +164,27 @@ def test_bump_blocks_target_without_marking_it_pit_free():
     assert facts_named(agent, "last-move") == []
 
 
+def test_blocked_cell_alone_does_not_imply_pit_free():
+    agent = make_agent()
+    agent.env.assert_string("(blocked (x 1) (y 1))")
+    agent.env.eval("(focus MAP)")
+    agent.env.run()
+
+    assert (1, 1) in cells(agent, "blocked")
+    assert (1, 1) in cells(agent, "no-wumpus")
+    assert (1, 1) not in cells(agent, "no-pit")
+    assert (1, 1) not in cells(agent, "safe")
+
+
 def test_repeated_cycles_do_not_duplicate_map_facts():
     agent = make_agent()
     for step in range(3):
         run_cycle(agent, make_obs(steps=step, energy=200 - step))
 
-    assert len(facts_named(agent, "nbr")) == 4
+    assert len(facts_named(agent, "nbr")) == 12
     assert len(facts_named(agent, "visited")) == 1
-    assert len(facts_named(agent, "safe")) == 1
-    assert len(facts_named(agent, "frontier")) == 0
-    assert cells(agent, "blocked") == {(0, -1), (-1, 0)}
+    assert len(facts_named(agent, "safe")) == 3
+    assert cells(agent, "frontier") == {(1, 0), (0, 1)}
+    assert cells(agent, "blocked") == {(0, -1), (1, -1), (-1, 0), (-1, 1)}
+    assert len(facts_named(agent, "no-breeze-at")) == 1
+    assert len(facts_named(agent, "no-stench-at")) == 1
