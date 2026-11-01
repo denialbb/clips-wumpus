@@ -544,6 +544,18 @@
      then
      (assert (wumpus (x ?px) (y ?py)))))
 
+; The Wumpus is unique: after one cell is confirmed, every other known cell is
+; Wumpus-free. Without this closure a pruned possibility would keep blocking
+; safe inference even though the Wumpus is already located.
+(defrule HYPO::confirmed-wumpus-excludes-others
+  (declare (salience 375))
+  (wumpus (x ?wx) (y ?wy))
+  (nbr (nx ?x) (ny ?y))
+  (test (or (neq ?x ?wx) (neq ?y ?wy)))
+  (not (no-wumpus (x ?x) (y ?y)))
+  =>
+  (assert (no-wumpus (x ?x) (y ?y))))
+
 ; Safety is classical: both hazards excluded and the cell is enterable.
 (defrule HYPO::infer-safe
   (declare (salience 360))
