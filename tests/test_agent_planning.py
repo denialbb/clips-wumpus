@@ -56,6 +56,18 @@ def advance(agent, obs):
     return agent.run_and_get_action()
 
 
+def modify_slot(agent, template, slot, value):
+    facts = facts_named(agent, template)
+    assert len(facts) == 1
+    agent.env.eval(f"(modify {facts[0].index} ({slot} {value}))")
+
+
+def probe_count(agent):
+    counts = [int(fact["count"]) for fact in facts_named(agent, "probes-used")]
+    assert len(counts) == 1
+    return counts[0]
+
+
 def setup_at_one():
     """Visit (0,0) and (1,0) in an open corridor."""
     agent = make_agent()
@@ -216,3 +228,74 @@ def test_each_cycle_seeds_one_navigation_root():
 
     assert advance(agent, make_obs(x=0, y=0, steps=4, energy=196)) == "quit"
     assert goal_fact(agent) == ("quit", 0, 0)
+
+
+def test_probe_selects_the_northern_low_cf_target_and_counts_once():
+    agent = make_agent(make_obs(breeze=True))
+
+    assert advance(agent, make_obs(breeze=True, steps=0)) == "right"
+    assert goal_fact(agent) == ("probe", 1, 0)
+    assert probe_count(agent) == 1
+    attempted = cells(agent, "probe-attempted")
+    assert attempted == {(1, 0)}
+
+
+def test_no_probe_when_a_safe_frontier_exists():
+    agent = make_agent()
+    advance(agent, make_obs(steps=0))
+    agent.env.assert_string(
+        "(pit-hypothesis (x 2) (y 0) (cf 0.4) "
+        "(source-x -1) (source-y -1))"
+    )
+
+    advance(agent, make_obs(steps=1))
+
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
+
+
+def test_no_probe_above_the_risk_threshold():
+    agent = make_agent(make_obs(breeze=True))
+    modify_slot(agent, "config", "risk-threshold", "0.3")
+
+    assert advance(agent, make_obs(breeze=True, steps=0)) == "quit"
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
+
+
+def test_no_probe_when_the_budget_is_exhausted():
+    agent = make_agent(make_obs(breeze=True))
+    modify_slot(agent, "probes-used", "count", "2")
+
+    assert advance(agent, make_obs(breeze=True, steps=0)) == "quit"
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
+
+
+def test_no_probe_without_the_return_reserve():
+    agent = make_agent(make_obs(breeze=True))
+
+    action = advance(agent, make_obs(breeze=True, steps=0, energy=6))
+
+    assert action == "quit"
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
+
+
+def test_no_probe_while_holding_gold():
+    agent = make_agent(make_obs(breeze=True))
+    agent.env.assert_string("(has-gold)")
+
+    assert advance(agent, make_obs(breeze=True, steps=0)) == "quit"
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
+
+
+def test_confirmed_pit_is_not_probed():
+    agent = make_agent(make_obs(breeze=True, stench=True))
+    agent.env.assert_string("(no-pit (x 0) (y 1))")
+
+    assert advance(agent, make_obs(breeze=True, stench=True, steps=0)) == "quit"
+    assert cells(agent, "pit") == {(1, 0)}
+    assert facts_named(agent, "best-probe") == []
+    assert facts_named(agent, "probe-attempted") == []
