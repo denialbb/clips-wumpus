@@ -1,0 +1,14 @@
+{
+  "width": 5,
+  "height": 5,
+  "start": [0, 0],
+  "walls": [[2, 2]],
+  "pits": [],
+  "wumpus": null,
+  "gold": [4, 4],
+  "max_steps": 14,
+  "step_cost": -1.0,
+  "death_cost": -100.0,
+  "grab_reward": 100.0,
+  "end_on_grab": false
+}
