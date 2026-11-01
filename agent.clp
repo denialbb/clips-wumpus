@@ -102,6 +102,13 @@
   (slot y (type INTEGER))
   (slot cf (type FLOAT)))
 
+; One visited approach cell for a probe target; owned by DECIDE.
+(deftemplate MAIN::probe-support
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot nx (type INTEGER))
+  (slot ny (type INTEGER)))
+
 ; Number of risky crossing attempts made in this episode; owned by ACT.
 (deftemplate MAIN::probes-used
   (slot count (type INTEGER)))
@@ -238,6 +245,12 @@
   "Count the cells that can hold the single Wumpus."
   (length$ (find-all-facts ((?w wumpus-possible)) TRUE)))
 
+; Number of visited approach cells for one probe target.
+(deffunction probe-support-count (?px ?py)
+  "Count the visited approach cells recorded for a probe target."
+  (length$ (find-all-facts ((?s probe-support))
+             (and (= ?s:x ?px) (= ?s:y ?py)))))
+
 ; Drop the navigation field when the goal changes inside a planning cycle.
 (deffunction clear-nav-facts ()
   "Retract every navigation distance fact."
@@ -255,6 +268,8 @@
     (retract ?best-fact))
   (foreach ?probe-fact (find-all-facts ((?fact best-probe)) TRUE)
     (retract ?probe-fact))
+  (foreach ?support-fact (find-all-facts ((?fact probe-support)) TRUE)
+    (retract ?support-fact))
   (foreach ?low-fact (find-all-facts ((?fact low-energy)) TRUE)
     (retract ?low-fact))
   (foreach ?goal-fact (find-all-facts ((?fact goal)) TRUE)
@@ -842,6 +857,17 @@
   =>
   (modify ?best (x ?x) (y ?y) (d ?d)))
 
+; Record every visited cell that can step into a probe candidate. More support
+; means more known escape routes and more evidence about the target.
+(defrule DECIDE::probe-support-from-approach
+  (declare (salience 880))
+  (pit-hypothesis (x ?px) (y ?py))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (not (probe-support (x ?px) (y ?py) (nx ?nx) (ny ?ny)))
+  =>
+  (assert (probe-support (x ?px) (y ?py) (nx ?nx) (ny ?ny))))
+
 ; A risky crossing is allowed only when safe exploration is exhausted, the
 ; return reserve is intact, the agent is not standing on the gold, and the
 ; probe budget has room. The candidate must still be a low-CF pit hypothesis.
@@ -873,8 +899,11 @@
   =>
   (assert (best-probe (x ?px) (y ?py) (cf ?cf))))
 
-; Rank probes by row, then column, then certainty factor. Geometry keeps the
-; crossing on the unexplored side of a cut; certainty only breaks exact ties.
+; Rank probes by support, then certainty, then geometry. The CF is inflated by
+; overlapping breezes: on map1 the actual pit (5,4) has cf 0.4 while the safe
+; crossing (4,3) has cf 0.64. A cell reached by more visited neighbours has
+; more known escape routes and more evidence, so it is the safer probe; CF is
+; the first tie-break after support.
 (defrule DECIDE::improve-best-probe
   (declare (salience 840))
   ?best <- (best-probe (x ?bx) (y ?by) (cf ?bcf))
@@ -900,9 +929,20 @@
   (dist (x ?nx) (y ?ny) (d ?d))
   (home (x ?nx) (y ?ny) (d ?h))
   (test (<= (+ ?d 2 ?h 1 ?r) ?e))
-  (test (or (< ?py ?by)
-            (and (= ?py ?by) (< ?px ?bx))
-            (and (= ?py ?by) (= ?px ?bx) (< ?cf ?bcf))))
+  (test (or (> (probe-support-count ?px ?py)
+               (probe-support-count ?bx ?by))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (< ?cf ?bcf))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (= ?cf ?bcf)
+                 (< ?py ?by))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (= ?cf ?bcf)
+                 (= ?py ?by)
+                 (< ?px ?bx))))
   =>
   (modify ?best (x ?px) (y ?py) (cf ?cf)))
 
