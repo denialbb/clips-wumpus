@@ -291,6 +291,48 @@ def test_no_probe_while_holding_gold():
     assert facts_named(agent, "probe-attempted") == []
 
 
+def add_support_scenario(agent):
+    facts = (
+        "(pos (x 0) (y 0))",
+        "(visited (x 0) (y 0))",
+        "(visited (x 1) (y 0))",
+        "(visited (x 0) (y 1))",
+        "(visited (x 1) (y 2))",
+        "(nbr (x 1) (y 0) (nx 2) (ny 0) (dir right) (rank 2))",
+        "(nbr (x 0) (y 1) (nx 0) (ny 2) (dir down) (rank 3))",
+        "(nbr (x 1) (y 2) (nx 0) (ny 2) (dir left) (rank 4))",
+        "(nbr (x 0) (y 0) (nx 0) (ny 1) (dir down) (rank 3))",
+        "(nbr (x 0) (y 1) (nx 0) (ny 0) (dir up) (rank 1))",
+        "(nbr (x 1) (y 0) (nx 0) (ny 0) (dir left) (rank 4))",
+        "(dist (x 1) (y 0) (d 1))",
+        "(dist (x 0) (y 1) (d 1))",
+        "(dist (x 1) (y 2) (d 2))",
+        "(home (x 1) (y 0) (d 1))",
+        "(home (x 0) (y 1) (d 1))",
+        "(home (x 1) (y 2) (d 2))",
+        "(pit-hypothesis (x 2) (y 0) (cf 0.2) "
+        "(source-x -1) (source-y -1))",
+        "(pit-hypothesis (x 0) (y 2) (cf 0.4) "
+        "(source-x -1) (source-y -1))",
+    )
+    for fact in facts:
+        agent.env.assert_string(fact)
+
+
+def test_probe_ranking_prefers_support_over_lower_cf():
+    agent = make_agent(make_obs(breeze=True))
+    modify_slot(agent, "plan", "step", "0")
+    add_support_scenario(agent)
+
+    agent.env.eval("(focus DECIDE)")
+    agent.env.run()
+
+    best = facts_named(agent, "best-probe")
+    assert len(best) == 1
+    assert (int(best[0]["x"]), int(best[0]["y"])) == (0, 2)
+    assert goal_fact(agent) == ("probe", 0, 2)
+
+
 def test_confirmed_pit_is_not_probed():
     agent = make_agent(make_obs(breeze=True, stench=True))
     agent.env.assert_string("(no-pit (x 0) (y 1))")
