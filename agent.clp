@@ -40,7 +40,9 @@
 (deftemplate MAIN::config
   (slot reserve (type INTEGER) (default 5))
   (slot evidence (type FLOAT) (default 0.4))
-  (slot guess-threshold (type FLOAT) (default 0.75)))
+  (slot guess-threshold (type FLOAT) (default 0.75))
+  (slot risk-threshold (type FLOAT) (default 0.75))
+  (slot max-probes (type INTEGER) (default 2)))
 
 ; Current agent position; PERCEPT maintains exactly one fact.
 (deftemplate MAIN::pos
@@ -80,6 +82,47 @@
 (deftemplate MAIN::frontier
   (slot x (type INTEGER))
   (slot y (type INTEGER)))
+
+; Singleton planner workspace marker; DECIDE advances its step once per cycle.
+(deftemplate MAIN::plan
+  (slot step (type INTEGER) (default -1)))
+
+; The agent holds the gold; it survives grab actions and all cycle cleanup.
+(deftemplate MAIN::has-gold)
+
+; Best affordable frontier for the current cycle; owned by DECIDE.
+(deftemplate MAIN::best-frontier
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot d (type INTEGER)))
+
+; Best eligible risky crossing for the current cycle; owned by DECIDE.
+(deftemplate MAIN::best-probe
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot cf (type FLOAT)))
+
+; One visited approach cell for a probe target; owned by DECIDE.
+(deftemplate MAIN::probe-support
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot nx (type INTEGER))
+  (slot ny (type INTEGER)))
+
+; Number of risky crossing attempts made in this episode; owned by ACT.
+(deftemplate MAIN::probes-used
+  (slot count (type INTEGER)))
+
+; Targets already used for a risky crossing; owned by ACT.
+(deftemplate MAIN::probe-attempted
+  (slot x (type INTEGER))
+  (slot y (type INTEGER)))
+
+; A probe target that became visited, which earns the next probe in the budget.
+(deftemplate MAIN::probe-success)
+
+; The reserve would be consumed by the return path; owned by DECIDE.
+(deftemplate MAIN::low-energy)
 
 ; Orthogonal movement deltas. The direction symbols are the simulator's
 ; action names; rank fixes the deterministic tie-break order used by later
@@ -202,9 +245,44 @@
   "Count the cells that can hold the single Wumpus."
   (length$ (find-all-facts ((?w wumpus-possible)) TRUE)))
 
+; Number of visited approach cells for one probe target.
+(deffunction probe-support-count (?px ?py)
+  "Count the visited approach cells recorded for a probe target."
+  (length$ (find-all-facts ((?s probe-support))
+             (and (= ?s:x ?px) (= ?s:y ?py)))))
+
+; Drop the navigation field when the goal changes inside a planning cycle.
+(deffunction clear-nav-facts ()
+  "Retract every navigation distance fact."
+  (foreach ?nav-fact (find-all-facts ((?fact nav)) TRUE)
+    (retract ?nav-fact)))
+
+; Reset the transient planning workspace. Persistent map knowledge, the plan
+; marker, and the held-gold flag are deliberately preserved.
+(deffunction clear-plan-facts ()
+  "Retract the planning facts that are rebuilt every cycle."
+  (clear-nav-facts)
+  (foreach ?dist-fact (find-all-facts ((?fact dist)) TRUE)
+    (retract ?dist-fact))
+  (foreach ?best-fact (find-all-facts ((?fact best-frontier)) TRUE)
+    (retract ?best-fact))
+  (foreach ?probe-fact (find-all-facts ((?fact best-probe)) TRUE)
+    (retract ?probe-fact))
+  (foreach ?support-fact (find-all-facts ((?fact probe-support)) TRUE)
+    (retract ?support-fact))
+  (foreach ?low-fact (find-all-facts ((?fact low-energy)) TRUE)
+    (retract ?low-fact))
+  (foreach ?goal-fact (find-all-facts ((?fact goal)) TRUE)
+    (retract ?goal-fact))
+  (foreach ?next-fact (find-all-facts ((?fact next)) TRUE)
+    (retract ?next-fact)))
+
 (deffacts MAIN::initial-state
   (counter (step 0))
-  (config (reserve 5) (evidence 0.4) (guess-threshold 0.75)))
+  (config (reserve 5) (evidence 0.4) (guess-threshold 0.75)
+          (risk-threshold 0.75) (max-probes 2))
+  (probes-used (count 0))
+  (plan (step -1)))
 
 (deffacts MAIN::movement-deltas
   (delta (dir up) (dx 0) (dy -1) (rank 1))
@@ -505,6 +583,18 @@
      then
      (assert (wumpus (x ?px) (y ?py)))))
 
+; The Wumpus is unique: after one cell is confirmed, every other known cell is
+; Wumpus-free. Without this closure a pruned possibility would keep blocking
+; safe inference even though the Wumpus is already located.
+(defrule HYPO::confirmed-wumpus-excludes-others
+  (declare (salience 375))
+  (wumpus (x ?wx) (y ?wy))
+  (nbr (nx ?x) (ny ?y))
+  (test (or (neq ?x ?wx) (neq ?y ?wy)))
+  (not (no-wumpus (x ?x) (y ?y)))
+  =>
+  (assert (no-wumpus (x ?x) (y ?y))))
+
 ; Safety is classical: both hazards excluded and the cell is enterable.
 (defrule HYPO::infer-safe
   (declare (salience 360))
@@ -516,6 +606,17 @@
   (not (safe (x ?x) (y ?y)))
   =>
   (assert (safe (x ?x) (y ?y))))
+
+; Cells made safe in this phase have no later MAP sweep in the same cycle, so
+; the frontier set must be maintained here as well or planning starts blind.
+(defrule HYPO::frontier-is-safe-unvisited
+  (declare (salience 350))
+  (safe (x ?x) (y ?y))
+  (not (visited (x ?x) (y ?y)))
+  (not (blocked (x ?x) (y ?y)))
+  (not (frontier (x ?x) (y ?y)))
+  =>
+  (assert (frontier (x ?x) (y ?y))))
 
 ; Every neighbour of a breeze that is not already excluded explains the breeze.
 ; Confirmed pits stay candidates: removing them would make a second cell look
@@ -599,11 +700,433 @@
 ; DECIDE: goal selection and distance fields
 ; ---------------------------------------------------------------------------
 
-; Seed the home field at the assumed exit. Relaxation is added later.
+; Open a fresh planning workspace once per bridge step. Retracting the previous
+; cycle's transient facts removes stale goals, paths, and rankings before any
+; rule can read them.
+(defrule DECIDE::clear-plan
+  (declare (salience 1000))
+  ?plan <- (plan (step ?old))
+  (counter (step ?step))
+  (test (neq ?old ?step))
+  =>
+  (clear-plan-facts)
+  (modify ?plan (step ?step)))
+
+; A probe that reached its target proves the crossing worked; only a successful
+; crossing unlocks the next one. A wall bump leaves no success and ends risk.
+(defrule DECIDE::mark-probe-success
+  (declare (salience 950))
+  (probe-attempted (x ?x) (y ?y))
+  (visited (x ?x) (y ?y))
+  (not (probe-success))
+  =>
+  (assert (probe-success)))
+
+; ---------------------------------------------------------------------------
+; DECIDE: persistent home field over the visited graph
+; ---------------------------------------------------------------------------
+
+; The assumed exit anchors the home field. The field persists across cycles and
+; only relaxes downward as the visited graph grows.
 (defrule DECIDE::seed-home-root
+  (declare (salience 980))
   (not (home (x 0) (y 0) (d ?)))
   =>
   (assert (home (x 0) (y 0) (d 0))))
+
+; Expand home through links whose source and target were both visited. A
+; frontier is a leaf: it receives a distance but never propagates one.
+(defrule DECIDE::home-expand
+  (declare (salience 960))
+  (home (x ?x) (y ?y) (d ?d))
+  (visited (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny))
+  (visited (x ?nx) (y ?ny))
+  (not (home (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (home (x ?nx) (y ?ny) (d (+ ?d 1)))))
+
+; A shorter route to an existing home distance always wins.
+(defrule DECIDE::home-relax
+  (declare (salience 960))
+  ?old <- (home (x ?x) (y ?y) (d ?old-d))
+  (home (x ?px) (y ?py) (d ?pd))
+  (visited (x ?px) (y ?py))
+  (nbr (x ?px) (y ?py) (nx ?x) (ny ?y))
+  (test (< (+ ?pd 1) ?old-d))
+  =>
+  (modify ?old (d (+ ?pd 1))))
+
+; Give each frontier a return distance through its visited neighbours without
+; ever routing the field through unvisited cells.
+(defrule DECIDE::home-extend-frontier
+  (declare (salience 950))
+  (home (x ?x) (y ?y) (d ?d))
+  (visited (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?fx) (ny ?fy))
+  (frontier (x ?fx) (y ?fy))
+  (not (home (x ?fx) (y ?fy) (d ?)))
+  =>
+  (assert (home (x ?fx) (y ?fy) (d (+ ?d 1)))))
+
+; ---------------------------------------------------------------------------
+; DECIDE: current-position distance field
+; ---------------------------------------------------------------------------
+
+(defrule DECIDE::seed-dist
+  (declare (salience 940))
+  (pos (x ?x) (y ?y))
+  (not (dist (x ?x) (y ?y) (d ?)))
+  =>
+  (assert (dist (x ?x) (y ?y) (d 0))))
+
+(defrule DECIDE::dist-expand
+  (declare (salience 930))
+  (dist (x ?x) (y ?y) (d ?d))
+  (visited (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny))
+  (visited (x ?nx) (y ?ny))
+  (not (dist (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (dist (x ?nx) (y ?ny) (d (+ ?d 1)))))
+
+(defrule DECIDE::dist-relax
+  (declare (salience 930))
+  ?old <- (dist (x ?x) (y ?y) (d ?old-d))
+  (dist (x ?px) (y ?py) (d ?pd))
+  (visited (x ?px) (y ?py))
+  (nbr (x ?px) (y ?py) (nx ?x) (ny ?y))
+  (test (< (+ ?pd 1) ?old-d))
+  =>
+  (modify ?old (d (+ ?pd 1))))
+
+(defrule DECIDE::dist-extend-frontier
+  (declare (salience 920))
+  (dist (x ?x) (y ?y) (d ?d))
+  (visited (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?fx) (ny ?fy))
+  (frontier (x ?fx) (y ?fy))
+  (not (dist (x ?fx) (y ?fy) (d ?)))
+  =>
+  (assert (dist (x ?fx) (y ?fy) (d (+ ?d 1)))))
+
+; ---------------------------------------------------------------------------
+; DECIDE: energy budget, goal, and route
+; ---------------------------------------------------------------------------
+
+; The reserve is no longer enough for a comfortable return.
+(defrule DECIDE::derive-low-energy
+  (declare (salience 900))
+  (pos (x ?x) (y ?y))
+  (home (x ?x) (y ?y) (d ?h))
+  (percept (energy ?e))
+  (config (reserve ?r))
+  (test (<= ?e (+ ?h ?r)))
+  (not (low-energy))
+  =>
+  (assert (low-energy)))
+
+; A frontier is affordable only when reaching it, returning home, taking the
+; final quit step, and keeping the reserve all fit in the current energy.
+(defrule DECIDE::seed-best-frontier
+  (declare (salience 870))
+  (not (best-frontier (x ?) (y ?) (d ?)))
+  (frontier (x ?x) (y ?y))
+  (dist (x ?x) (y ?y) (d ?d))
+  (home (x ?x) (y ?y) (d ?h))
+  (config (reserve ?r))
+  (percept (energy ?e))
+  (test (<= (+ ?d ?h 1 ?r) ?e))
+  =>
+  (assert (best-frontier (x ?x) (y ?y) (d ?d))))
+
+; Rank candidates by distance, then by the lower row, then by the lower column.
+; The strict comparison cannot oscillate because it never rewrites an equal key.
+(defrule DECIDE::improve-best-frontier
+  (declare (salience 860))
+  ?best <- (best-frontier (x ?bx) (y ?by) (d ?bd))
+  (frontier (x ?x) (y ?y))
+  (dist (x ?x) (y ?y) (d ?d))
+  (home (x ?x) (y ?y) (d ?h))
+  (config (reserve ?r))
+  (percept (energy ?e))
+  (test (<= (+ ?d ?h 1 ?r) ?e))
+  (test (or (< ?d ?bd)
+            (and (= ?d ?bd) (< ?y ?by))
+            (and (= ?d ?bd) (= ?y ?by) (< ?x ?bx))))
+  =>
+  (modify ?best (x ?x) (y ?y) (d ?d)))
+
+; Record every visited cell that can step into a probe candidate. More support
+; means more known escape routes and more evidence about the target.
+(defrule DECIDE::probe-support-from-approach
+  (declare (salience 880))
+  (pit-hypothesis (x ?px) (y ?py))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (not (probe-support (x ?px) (y ?py) (nx ?nx) (ny ?ny)))
+  =>
+  (assert (probe-support (x ?px) (y ?py) (nx ?nx) (ny ?ny))))
+
+; A risky crossing is allowed only when safe exploration is exhausted, the
+; return reserve is intact, the agent is not standing on the gold, and the
+; probe budget has room. The candidate must still be a low-CF pit hypothesis.
+(defrule DECIDE::seed-best-probe
+  (declare (salience 850))
+  (not (best-probe (x ?) (y ?) (cf ?)))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE) (energy ?e))
+  (probes-used (count ?used))
+  (config (risk-threshold ?threshold) (max-probes ?max) (reserve ?r))
+  (test (< ?used ?max))
+  (or (test (= ?used 0))
+      (probe-success))
+  (pit-hypothesis (x ?px) (y ?py) (cf ?cf))
+  (not (visited (x ?px) (y ?py)))
+  (not (safe (x ?px) (y ?py)))
+  (not (blocked (x ?px) (y ?py)))
+  (not (wumpus (x ?px) (y ?py)))
+  (not (wumpus-possible (x ?px) (y ?py)))
+  (not (probe-attempted (x ?px) (y ?py)))
+  (test (<= ?cf ?threshold))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (dist (x ?nx) (y ?ny) (d ?d))
+  (home (x ?nx) (y ?ny) (d ?h))
+  (test (<= (+ ?d 2 ?h 1 ?r) ?e))
+  =>
+  (assert (best-probe (x ?px) (y ?py) (cf ?cf))))
+
+; Rank probes by support, then certainty, then geometry. The CF is inflated by
+; overlapping breezes: on map1 the actual pit (5,4) has cf 0.4 while the safe
+; crossing (4,3) has cf 0.64. A cell reached by more visited neighbours has
+; more known escape routes and more evidence, so it is the safer probe; CF is
+; the first tie-break after support.
+(defrule DECIDE::improve-best-probe
+  (declare (salience 840))
+  ?best <- (best-probe (x ?bx) (y ?by) (cf ?bcf))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE) (energy ?e))
+  (probes-used (count ?used))
+  (config (risk-threshold ?threshold) (max-probes ?max) (reserve ?r))
+  (test (< ?used ?max))
+  (or (test (= ?used 0))
+      (probe-success))
+  (pit-hypothesis (x ?px) (y ?py) (cf ?cf))
+  (not (visited (x ?px) (y ?py)))
+  (not (safe (x ?px) (y ?py)))
+  (not (blocked (x ?px) (y ?py)))
+  (not (wumpus (x ?px) (y ?py)))
+  (not (wumpus-possible (x ?px) (y ?py)))
+  (not (probe-attempted (x ?px) (y ?py)))
+  (test (<= ?cf ?threshold))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (dist (x ?nx) (y ?ny) (d ?d))
+  (home (x ?nx) (y ?ny) (d ?h))
+  (test (<= (+ ?d 2 ?h 1 ?r) ?e))
+  (test (or (> (probe-support-count ?px ?py)
+               (probe-support-count ?bx ?by))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (< ?cf ?bcf))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (= ?cf ?bcf)
+                 (< ?py ?by))
+            (and (= (probe-support-count ?px ?py)
+                    (probe-support-count ?bx ?by))
+                 (= ?cf ?bcf)
+                 (= ?py ?by)
+                 (< ?px ?bx))))
+  =>
+  (modify ?best (x ?px) (y ?py) (cf ?cf)))
+
+; Grab only when the return path, the grab, the final quit, and the reserve all
+; remain affordable; otherwise survival wins.
+(defrule DECIDE::goal-grab
+  (declare (salience 820))
+  (percept (x ?x) (y ?y) (glitter TRUE) (energy ?e))
+  (pos (x ?x) (y ?y))
+  (home (x ?x) (y ?y) (d ?h))
+  (config (reserve ?r))
+  (not (has-gold))
+  (test (>= ?e (+ ?h ?r 2)))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind grab) (x ?x) (y ?y))))
+
+; Risky crossing outranks quit and return but never grab. The guards repeat the
+; trigger conditions so a stale best-probe fact cannot cause a gamble.
+(defrule DECIDE::goal-probe
+  (declare (salience 815))
+  (best-probe (x ?px) (y ?py) (cf ?cf))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE))
+  (probes-used (count ?used))
+  (config (max-probes ?max))
+  (test (< ?used ?max))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind probe) (x ?px) (y ?py))))
+
+(defrule DECIDE::goal-quit-with-gold
+  (declare (salience 810))
+  (pos (x 0) (y 0))
+  (has-gold)
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind quit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-quit-low-energy
+  (declare (salience 805))
+  (pos (x 0) (y 0))
+  (low-energy)
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind quit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-quit-no-frontier
+  (declare (salience 800))
+  (pos (x 0) (y 0))
+  (not (best-frontier (x ?) (y ?) (d ?)))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind quit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-exit-with-gold
+  (declare (salience 790))
+  (pos (x ?x) (y ?y))
+  (test (or (neq ?x 0) (neq ?y 0)))
+  (has-gold)
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind exit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-exit-low-energy
+  (declare (salience 785))
+  (pos (x ?x) (y ?y))
+  (test (or (neq ?x 0) (neq ?y 0)))
+  (low-energy)
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind exit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-exit-no-frontier
+  (declare (salience 780))
+  (pos (x ?x) (y ?y))
+  (test (or (neq ?x 0) (neq ?y 0)))
+  (not (best-frontier (x ?) (y ?) (d ?)))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind exit) (x 0) (y 0))))
+
+(defrule DECIDE::goal-frontier
+  (declare (salience 770))
+  (best-frontier (x ?x) (y ?y) (d ?))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind frontier) (x ?x) (y ?y))))
+
+; Seed the navigation field at the chosen goal. The exit is visited, so the
+; ordinary expansion rules can carry its field; a frontier is entered from the
+; visited neighbours that the link graph already exposes.
+(defrule DECIDE::nav-seed-exit
+  (declare (salience 740))
+  (goal (kind exit))
+  (not (nav (x 0) (y 0) (d ?)))
+  =>
+  (assert (nav (x 0) (y 0) (d 0))))
+
+(defrule DECIDE::nav-seed-frontier
+  (declare (salience 740))
+  (goal (kind frontier) (x ?gx) (y ?gy))
+  (not (nav (x ?gx) (y ?gy) (d ?)))
+  =>
+  (assert (nav (x ?gx) (y ?gy) (d 0))))
+
+(defrule DECIDE::nav-seed-frontier-neighbour
+  (declare (salience 730))
+  (goal (kind frontier) (x ?gx) (y ?gy))
+  (nbr (x ?nx) (y ?ny) (nx ?gx) (ny ?gy))
+  (visited (x ?nx) (y ?ny))
+  (not (nav (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (nav (x ?nx) (y ?ny) (d 1))))
+
+(defrule DECIDE::nav-seed-probe
+  (declare (salience 740))
+  (goal (kind probe) (x ?gx) (y ?gy))
+  (not (nav (x ?gx) (y ?gy) (d ?)))
+  =>
+  (assert (nav (x ?gx) (y ?gy) (d 0))))
+
+(defrule DECIDE::nav-seed-probe-neighbour
+  (declare (salience 730))
+  (goal (kind probe) (x ?gx) (y ?gy))
+  (nbr (x ?nx) (y ?ny) (nx ?gx) (ny ?gy))
+  (visited (x ?nx) (y ?ny))
+  (not (nav (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (nav (x ?nx) (y ?ny) (d 1))))
+
+(defrule DECIDE::nav-expand
+  (declare (salience 720))
+  (nav (x ?x) (y ?y) (d ?d))
+  (visited (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny))
+  (visited (x ?nx) (y ?ny))
+  (not (nav (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (nav (x ?nx) (y ?ny) (d (+ ?d 1)))))
+
+(defrule DECIDE::nav-relax
+  (declare (salience 720))
+  ?old <- (nav (x ?x) (y ?y) (d ?old-d))
+  (nav (x ?px) (y ?py) (d ?pd))
+  (visited (x ?px) (y ?py))
+  (nbr (x ?px) (y ?py) (nx ?x) (ny ?y))
+  (test (< (+ ?pd 1) ?old-d))
+  =>
+  (modify ?old (d (+ ?pd 1))))
+
+; A neighbour one navigation step closer to the goal is a valid next hop.
+(defrule DECIDE::next-hop
+  (declare (salience 700))
+  (pos (x ?x) (y ?y))
+  (nav (x ?x) (y ?y) (d ?d))
+  (nbr (x ?x) (y ?y) (nx ?nx) (ny ?ny) (dir ?dir) (rank ?rank))
+  (nav (x ?nx) (y ?ny) (d ?nd))
+  (test (= ?nd (- ?d 1)))
+  (not (next (dir ?dir) (rank ?rank)))
+  =>
+  (assert (next (dir ?dir) (rank ?rank))))
+
+; If the frontier route produced no hop, abandon exploration for survival and
+; rebuild the plan toward the exit.
+(defrule DECIDE::fallback-frontier-to-exit
+  (declare (salience 690))
+  ?goal <- (goal (kind frontier) (x ?gx) (y ?gy))
+  (not (next (dir ?dir) (rank ?rank)))
+  =>
+  (clear-nav-facts)
+  (retract ?goal)
+  (assert (goal (kind exit) (x 0) (y 0))))
+
+(defrule DECIDE::fallback-probe-to-exit
+  (declare (salience 690))
+  ?goal <- (goal (kind probe) (x ?gx) (y ?gy))
+  (not (next (dir ?dir) (rank ?rank)))
+  =>
+  (clear-nav-facts)
+  (retract ?goal)
+  (assert (goal (kind exit) (x 0) (y 0))))
 
 
 ; ---------------------------------------------------------------------------
@@ -619,20 +1142,64 @@
   =>
   (assert (last-move (move ?dir) (from-x ?x) (from-y ?y))))
 
-; SCAFFOLD FALLBACK: remove once DECIDE selects a goal-driven action.
-; At the exit, quit; anywhere else, stay put and grab.
-(defrule ACT::scaffold-quit-at-origin
-  (declare (salience 100))
+; Collect the gold only when DECIDE selected the grab goal for a glittering
+; cell and the agent does not already hold it.
+(defrule ACT::act-grab
+  (declare (salience 500))
+  (goal (kind grab) (x ?x) (y ?y))
+  (percept (x ?x) (y ?y) (glitter TRUE))
+  (not (has-gold))
+  (not (action (move ?)))
+  =>
+  (assert (action (move grab)))
+  (assert (has-gold)))
+
+; Quit only from the exit; the plan never selects quit elsewhere.
+(defrule ACT::act-quit
+  (declare (salience 480))
+  (goal (kind quit))
   (pos (x 0) (y 0))
   (not (action (move ?)))
   =>
   (assert (action (move quit))))
 
-; SCAFFOLD FALLBACK: remove once DECIDE selects a goal-driven action.
-(defrule ACT::scaffold-grab-elsewhere
-  (declare (salience 90))
-  (pos (x ?x) (y ?y))
-  (test (or (neq ?x 0) (neq ?y 0)))
+; Follow the best-ranked hop toward a frontier or the exit.
+(defrule ACT::act-move
+  (declare (salience 460))
+  (goal (kind ?kind))
+  (test (or (eq ?kind frontier) (eq ?kind exit) (eq ?kind probe)))
+  (next (dir ?dir) (rank ?rank))
+  (not (and (next (dir ?) (rank ?other-rank))
+            (test (< ?other-rank ?rank))))
   (not (action (move ?)))
   =>
-  (assert (action (move grab))))
+  (assert (action (move ?dir))))
+
+; Count a risky crossing once, when the emitted move actually enters the probe
+; target. The marker makes the singleton count idempotent for that target.
+(defrule ACT::count-probe
+  (declare (salience 440))
+  (goal (kind probe) (x ?px) (y ?py))
+  (pos (x ?x) (y ?y))
+  (delta (dir ?dir) (dx ?dx) (dy ?dy))
+  (action (move ?dir))
+  (test (= (+ ?x ?dx) ?px))
+  (test (= (+ ?y ?dy) ?py))
+  (not (probe-attempted (x ?px) (y ?py)))
+  ?count <- (probes-used (count ?used))
+  =>
+  (modify ?count (count (+ ?used 1)))
+  (assert (probe-attempted (x ?px) (y ?py))))
+
+; Safety net for the one-action protocol: if planning produced no action, stay
+; alive at the exit or hold position. It never overrides a goal-driven action.
+(defrule ACT::last-resort
+  (declare (salience 10))
+  (pos (x ?x) (y ?y))
+  (not (action (move ?)))
+  =>
+  (if (and (= ?x 0) (= ?y 0))
+     then
+     (assert (action (move quit)))
+     else
+     (assert (action (move grab)))))

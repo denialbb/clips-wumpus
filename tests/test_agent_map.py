@@ -52,6 +52,11 @@ def record_move(agent, move, x, y):
     )
 
 
+def clear_move_intents(agent):
+    for intent in facts_named(agent, "last-move"):
+        intent.retract()
+
+
 def test_origin_seeds_position_and_neighbour_graph():
     agent = make_agent()
     agent.run_and_get_action()
@@ -88,14 +93,16 @@ def test_negative_neighbours_are_outside_and_hazard_free():
 def test_frontier_appears_for_safe_unvisited_cell_and_disappears_when_blocked():
     agent = make_agent()
     agent.run_and_get_action()
-    assert cells(agent, "frontier") == set()
+    assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
+    clear_move_intents(agent)
     agent.env.assert_string("(safe (x 1) (y 0))")
     agent.env.run()
     assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
+    clear_move_intents(agent)
     agent.env.assert_string("(blocked (x 1) (y 0))")
     agent.env.run()
     assert (1, 0) not in cells(agent, "safe")
@@ -105,13 +112,16 @@ def test_frontier_appears_for_safe_unvisited_cell_and_disappears_when_blocked():
 def test_frontier_disappears_when_cell_becomes_visited():
     agent = make_agent()
     agent.run_and_get_action()
+    assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
+    clear_move_intents(agent)
     agent.env.assert_string("(safe (x 1) (y 0))")
     agent.env.run()
     assert cells(agent, "frontier") == {(1, 0), (0, 1)}
 
     agent.clear_action_facts()
+    clear_move_intents(agent)
     agent.env.assert_string("(visited (x 1) (y 0))")
     agent.env.run()
     assert cells(agent, "frontier") == {(0, 1)}
@@ -145,7 +155,11 @@ def test_successful_move_updates_position_and_consumes_intent():
     assert len(positions) == 1
     assert (int(positions[0]["x"]), int(positions[0]["y"])) == (1, 0)
     assert cells(agent, "visited") == {(0, 0), (1, 0)}
-    assert facts_named(agent, "last-move") == []
+    origins = {
+        (int(fact["from-x"]), int(fact["from-y"]))
+        for fact in facts_named(agent, "last-move")
+    }
+    assert (0, 0) not in origins
     assert (1, 0) not in cells(agent, "blocked")
 
 
@@ -180,6 +194,10 @@ def test_repeated_cycles_do_not_duplicate_map_facts():
     agent = make_agent()
     for step in range(3):
         run_cycle(agent, make_obs(steps=step, energy=200 - step))
+        # Keep the percept at the origin so the test isolates map closure from
+        # the movement that a real episode would perform.
+        for intent in facts_named(agent, "last-move"):
+            intent.retract()
 
     assert len(facts_named(agent, "nbr")) == 12
     assert len(facts_named(agent, "visited")) == 1
