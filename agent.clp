@@ -40,7 +40,9 @@
 (deftemplate MAIN::config
   (slot reserve (type INTEGER) (default 5))
   (slot evidence (type FLOAT) (default 0.4))
-  (slot guess-threshold (type FLOAT) (default 0.75)))
+  (slot guess-threshold (type FLOAT) (default 0.75))
+  (slot risk-threshold (type FLOAT) (default 0.75))
+  (slot max-probes (type INTEGER) (default 2)))
 
 ; Current agent position; PERCEPT maintains exactly one fact.
 (deftemplate MAIN::pos
@@ -93,6 +95,24 @@
   (slot x (type INTEGER))
   (slot y (type INTEGER))
   (slot d (type INTEGER)))
+
+; Best eligible risky crossing for the current cycle; owned by DECIDE.
+(deftemplate MAIN::best-probe
+  (slot x (type INTEGER))
+  (slot y (type INTEGER))
+  (slot cf (type FLOAT)))
+
+; Number of risky crossing attempts made in this episode; owned by ACT.
+(deftemplate MAIN::probes-used
+  (slot count (type INTEGER)))
+
+; Targets already used for a risky crossing; owned by ACT.
+(deftemplate MAIN::probe-attempted
+  (slot x (type INTEGER))
+  (slot y (type INTEGER)))
+
+; A probe target that became visited, which earns the next probe in the budget.
+(deftemplate MAIN::probe-success)
 
 ; The reserve would be consumed by the return path; owned by DECIDE.
 (deftemplate MAIN::low-energy)
@@ -233,6 +253,8 @@
     (retract ?dist-fact))
   (foreach ?best-fact (find-all-facts ((?fact best-frontier)) TRUE)
     (retract ?best-fact))
+  (foreach ?probe-fact (find-all-facts ((?fact best-probe)) TRUE)
+    (retract ?probe-fact))
   (foreach ?low-fact (find-all-facts ((?fact low-energy)) TRUE)
     (retract ?low-fact))
   (foreach ?goal-fact (find-all-facts ((?fact goal)) TRUE)
@@ -242,7 +264,9 @@
 
 (deffacts MAIN::initial-state
   (counter (step 0))
-  (config (reserve 5) (evidence 0.4) (guess-threshold 0.75))
+  (config (reserve 5) (evidence 0.4) (guess-threshold 0.75)
+          (risk-threshold 0.75) (max-probes 2))
+  (probes-used (count 0))
   (plan (step -1)))
 
 (deffacts MAIN::movement-deltas
@@ -673,6 +697,16 @@
   (clear-plan-facts)
   (modify ?plan (step ?step)))
 
+; A probe that reached its target proves the crossing worked; only a successful
+; crossing unlocks the next one. A wall bump leaves no success and ends risk.
+(defrule DECIDE::mark-probe-success
+  (declare (salience 950))
+  (probe-attempted (x ?x) (y ?y))
+  (visited (x ?x) (y ?y))
+  (not (probe-success))
+  =>
+  (assert (probe-success)))
+
 ; ---------------------------------------------------------------------------
 ; DECIDE: persistent home field over the visited graph
 ; ---------------------------------------------------------------------------
@@ -808,6 +842,70 @@
   =>
   (modify ?best (x ?x) (y ?y) (d ?d)))
 
+; A risky crossing is allowed only when safe exploration is exhausted, the
+; return reserve is intact, the agent is not standing on the gold, and the
+; probe budget has room. The candidate must still be a low-CF pit hypothesis.
+(defrule DECIDE::seed-best-probe
+  (declare (salience 850))
+  (not (best-probe (x ?) (y ?) (cf ?)))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE) (energy ?e))
+  (probes-used (count ?used))
+  (config (risk-threshold ?threshold) (max-probes ?max) (reserve ?r))
+  (test (< ?used ?max))
+  (or (test (= ?used 0))
+      (probe-success))
+  (pit-hypothesis (x ?px) (y ?py) (cf ?cf))
+  (not (visited (x ?px) (y ?py)))
+  (not (safe (x ?px) (y ?py)))
+  (not (blocked (x ?px) (y ?py)))
+  (not (wumpus (x ?px) (y ?py)))
+  (not (wumpus-possible (x ?px) (y ?py)))
+  (not (probe-attempted (x ?px) (y ?py)))
+  (test (<= ?cf ?threshold))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (dist (x ?nx) (y ?ny) (d ?d))
+  (home (x ?nx) (y ?ny) (d ?h))
+  (test (<= (+ ?d 2 ?h 1 ?r) ?e))
+  =>
+  (assert (best-probe (x ?px) (y ?py) (cf ?cf))))
+
+; Rank probes by row, then column, then certainty factor. Geometry keeps the
+; crossing on the unexplored side of a cut; certainty only breaks exact ties.
+(defrule DECIDE::improve-best-probe
+  (declare (salience 840))
+  ?best <- (best-probe (x ?bx) (y ?by) (cf ?bcf))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE) (energy ?e))
+  (probes-used (count ?used))
+  (config (risk-threshold ?threshold) (max-probes ?max) (reserve ?r))
+  (test (< ?used ?max))
+  (or (test (= ?used 0))
+      (probe-success))
+  (pit-hypothesis (x ?px) (y ?py) (cf ?cf))
+  (not (visited (x ?px) (y ?py)))
+  (not (safe (x ?px) (y ?py)))
+  (not (blocked (x ?px) (y ?py)))
+  (not (wumpus (x ?px) (y ?py)))
+  (not (wumpus-possible (x ?px) (y ?py)))
+  (not (probe-attempted (x ?px) (y ?py)))
+  (test (<= ?cf ?threshold))
+  (visited (x ?nx) (y ?ny))
+  (nbr (x ?nx) (y ?ny) (nx ?px) (ny ?py))
+  (dist (x ?nx) (y ?ny) (d ?d))
+  (home (x ?nx) (y ?ny) (d ?h))
+  (test (<= (+ ?d 2 ?h 1 ?r) ?e))
+  (test (or (< ?py ?by)
+            (and (= ?py ?by) (< ?px ?bx))
+            (and (= ?py ?by) (= ?px ?bx) (< ?cf ?bcf))))
+  =>
+  (modify ?best (x ?px) (y ?py) (cf ?cf)))
+
 ; Grab only when the return path, the grab, the final quit, and the reserve all
 ; remain affordable; otherwise survival wins.
 (defrule DECIDE::goal-grab
@@ -821,6 +919,22 @@
   (not (goal (kind ?) (x ?) (y ?)))
   =>
   (assert (goal (kind grab) (x ?x) (y ?y))))
+
+; Risky crossing outranks quit and return but never grab. The guards repeat the
+; trigger conditions so a stale best-probe fact cannot cause a gamble.
+(defrule DECIDE::goal-probe
+  (declare (salience 815))
+  (best-probe (x ?px) (y ?py) (cf ?cf))
+  (not (has-gold))
+  (not (frontier (x ?) (y ?)))
+  (not (low-energy))
+  (percept (glitter FALSE))
+  (probes-used (count ?used))
+  (config (max-probes ?max))
+  (test (< ?used ?max))
+  (not (goal (kind ?) (x ?) (y ?)))
+  =>
+  (assert (goal (kind probe) (x ?px) (y ?py))))
 
 (defrule DECIDE::goal-quit-with-gold
   (declare (salience 810))
@@ -906,6 +1020,22 @@
   =>
   (assert (nav (x ?nx) (y ?ny) (d 1))))
 
+(defrule DECIDE::nav-seed-probe
+  (declare (salience 740))
+  (goal (kind probe) (x ?gx) (y ?gy))
+  (not (nav (x ?gx) (y ?gy) (d ?)))
+  =>
+  (assert (nav (x ?gx) (y ?gy) (d 0))))
+
+(defrule DECIDE::nav-seed-probe-neighbour
+  (declare (salience 730))
+  (goal (kind probe) (x ?gx) (y ?gy))
+  (nbr (x ?nx) (y ?ny) (nx ?gx) (ny ?gy))
+  (visited (x ?nx) (y ?ny))
+  (not (nav (x ?nx) (y ?ny) (d ?)))
+  =>
+  (assert (nav (x ?nx) (y ?ny) (d 1))))
+
 (defrule DECIDE::nav-expand
   (declare (salience 720))
   (nav (x ?x) (y ?y) (d ?d))
@@ -943,6 +1073,15 @@
 (defrule DECIDE::fallback-frontier-to-exit
   (declare (salience 690))
   ?goal <- (goal (kind frontier) (x ?gx) (y ?gy))
+  (not (next (dir ?dir) (rank ?rank)))
+  =>
+  (clear-nav-facts)
+  (retract ?goal)
+  (assert (goal (kind exit) (x 0) (y 0))))
+
+(defrule DECIDE::fallback-probe-to-exit
+  (declare (salience 690))
+  ?goal <- (goal (kind probe) (x ?gx) (y ?gy))
   (not (next (dir ?dir) (rank ?rank)))
   =>
   (clear-nav-facts)
@@ -988,13 +1127,29 @@
 (defrule ACT::act-move
   (declare (salience 460))
   (goal (kind ?kind))
-  (test (or (eq ?kind frontier) (eq ?kind exit)))
+  (test (or (eq ?kind frontier) (eq ?kind exit) (eq ?kind probe)))
   (next (dir ?dir) (rank ?rank))
   (not (and (next (dir ?) (rank ?other-rank))
             (test (< ?other-rank ?rank))))
   (not (action (move ?)))
   =>
   (assert (action (move ?dir))))
+
+; Count a risky crossing once, when the emitted move actually enters the probe
+; target. The marker makes the singleton count idempotent for that target.
+(defrule ACT::count-probe
+  (declare (salience 440))
+  (goal (kind probe) (x ?px) (y ?py))
+  (pos (x ?x) (y ?y))
+  (delta (dir ?dir) (dx ?dx) (dy ?dy))
+  (action (move ?dir))
+  (test (= (+ ?x ?dx) ?px))
+  (test (= (+ ?y ?dy) ?py))
+  (not (probe-attempted (x ?px) (y ?py)))
+  ?count <- (probes-used (count ?used))
+  =>
+  (modify ?count (count (+ ?used 1)))
+  (assert (probe-attempted (x ?px) (y ?py))))
 
 ; Safety net for the one-action protocol: if planning produced no action, stay
 ; alive at the exit or hold position. It never overrides a goal-driven action.
