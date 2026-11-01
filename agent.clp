@@ -133,6 +133,13 @@
   (slot dy (type INTEGER))
   (slot rank (type INTEGER)))
 
+; Direction-to-guess mapping. A pit guess names the adjacent cell in that
+; direction without moving the agent.
+(deftemplate MAIN::pit-action
+  (slot dir (type SYMBOL) (allowed-values up down left right))
+  (slot guess (type SYMBOL)
+        (allowed-values pit-north pit-south pit-west pit-east)))
+
 ; Directed link from a safe source to one of its four neighbours. The target
 ; may lie outside the known map; MAP marks it blocked once a bump proves it.
 (deftemplate MAIN::nbr
@@ -289,6 +296,14 @@
   (delta (dir right) (dx 1) (dy 0) (rank 2))
   (delta (dir down) (dx 0) (dy 1) (rank 3))
   (delta (dir left) (dx -1) (dy 0) (rank 4)))
+
+; Guess names follow the simulator's cardinal mapping: up is north, right is
+; east, down is south, and left is west.
+(deffacts MAIN::pit-direction-actions
+  (pit-action (dir up) (guess pit-north))
+  (pit-action (dir right) (guess pit-east))
+  (pit-action (dir down) (guess pit-south))
+  (pit-action (dir left) (guess pit-west)))
 
 
 ; ---------------------------------------------------------------------------
@@ -889,6 +904,7 @@
   (not (blocked (x ?px) (y ?py)))
   (not (wumpus (x ?px) (y ?py)))
   (not (wumpus-possible (x ?px) (y ?py)))
+  (not (guessed (x ?px) (y ?py)))
   (not (probe-attempted (x ?px) (y ?py)))
   (test (<= ?cf ?threshold))
   (visited (x ?nx) (y ?ny))
@@ -922,6 +938,7 @@
   (not (blocked (x ?px) (y ?py)))
   (not (wumpus (x ?px) (y ?py)))
   (not (wumpus-possible (x ?px) (y ?py)))
+  (not (guessed (x ?px) (y ?py)))
   (not (probe-attempted (x ?px) (y ?py)))
   (test (<= ?cf ?threshold))
   (visited (x ?nx) (y ?ny))
@@ -1162,6 +1179,36 @@
   (not (action (move ?)))
   =>
   (assert (action (move quit))))
+
+; Spend one energy on a high-confidence adjacent pit guess. Return, gold, and
+; grab goals outrank the guess, and the guess must leave the return reserve
+; intact. A guess does not move, so it creates no last-move fact, and the
+; persistent marker prevents spending a second guess on the same cell.
+(defrule ACT::act-guess-pit
+  (declare (salience 470))
+  (pos (x ?x) (y ?y))
+  (nbr (x ?x) (y ?y) (nx ?gx) (ny ?gy) (dir ?dir))
+  (pit-action (dir ?dir) (guess ?guess))
+  (pit-hypothesis (x ?gx) (y ?gy) (cf ?cf))
+  (config (guess-threshold ?threshold) (reserve ?reserve))
+  (percept (energy ?energy))
+  (home (x ?x) (y ?y) (d ?home))
+  (test (>= ?cf ?threshold))
+  (test (> ?energy (+ ?home ?reserve 1)))
+  (not (has-gold))
+  (not (goal (kind probe)))
+  (not (goal (kind exit)))
+  (not (goal (kind grab)))
+  (not (guessed (x ?gx) (y ?gy)))
+  (not (visited (x ?gx) (y ?gy)))
+  (not (safe (x ?gx) (y ?gy)))
+  (not (blocked (x ?gx) (y ?gy)))
+  (not (wumpus (x ?gx) (y ?gy)))
+  (not (wumpus-possible (x ?gx) (y ?gy)))
+  (not (action (move ?)))
+  =>
+  (assert (action (move ?guess)))
+  (assert (guessed (x ?gx) (y ?gy))))
 
 ; Follow the best-ranked hop toward a frontier or the exit.
 (defrule ACT::act-move
